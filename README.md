@@ -1,5 +1,7 @@
 # VirtualCellJEPA
 
+> **Disclaimer:** This is an independent re-implementation of the Cell-JEPA architecture described in ElSheikh et al. (2026). It is not affiliated with or endorsed by the original authors.
+
 A PyTorch implementation of **Cell-JEPA**, a joint-embedding predictive architecture for single-cell RNA-seq representation learning, based on the paper:
 
 > *Cell-JEPA: Latent Representation Learning for Single-Cell Transcriptomics*
