@@ -1,0 +1,31 @@
+# AWS / deployment
+ec2_session.txt
+instance_id.txt
+instance_ip.txt
+deploy_*.sh
+launch_ec2.sh
+ec2_setup.sh
+setup_aws_complete.sh
+deploy_to_ec2.sh
+upload_to_colab.sh
+aws_results/
+
+# Data
+data/
+
+# Outputs
+results*.txt
+run_*.txt
+*.png
+
+# Paper PDF
+CellJEPA.pdf
+
+# Scratch notebooks
+colab_setup.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
