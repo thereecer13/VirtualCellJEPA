@@ -60,7 +60,7 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
 
     # Subsample obs IDs before downloading to avoid OOM on full 1.4M cells.
     # The paper used ~800k cells; we cap at 800k (or 500 for smoke test).
-    n_target = 500 if smoke_test else 800_000
+    n_target = 500 if smoke_test else 200_000
     print(f"Querying CELLxGENE Census for human kidney cell IDs...")
     census = cellxgene_census.open_soma()
     obs_df = census["census_data"]["homo_sapiens"]["obs"].read(
