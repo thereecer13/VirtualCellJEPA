@@ -79,9 +79,12 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
 
     # Basic QC
     sc.pp.filter_cells(adata, min_genes=200)
+    print(f"  After filter_cells: {adata.n_obs:,} cells")
     sc.pp.filter_genes(adata, min_cells=3)
+    print(f"  After filter_genes: {adata.n_vars:,} genes")
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
+    print(f"  Normalised and log1p transformed")
 
     # Gene selection: use pre-specified list or select HVGs
     if gene_list is not None:
@@ -111,6 +114,11 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
 
     gene_names = list(adata.var_names)
     print(f"  Final: {X.shape[0]:,} cells × {X.shape[1]:,} HVGs")
+    if X.shape[0] == 0:
+        raise RuntimeError("No cells remaining after QC and HVG filtering — check Census data format.")
+    if X.shape[1] == 0:
+        raise RuntimeError("No genes remaining after HVG filtering.")
+    print(f"  Expression range: [{X.min():.3f}, {X.max():.3f}]  (should be log-normalised, ~0–10)")
     return X, gene_names
 
 
