@@ -322,7 +322,7 @@ def run_condition(
     print(f"  CellJEPA: {n_params/1e6:.1f}M parameters (d_model={d_model}, n_layers={n_layers})")
 
     if args.pretrain_checkpoint:
-        ckpt = torch.load(args.pretrain_checkpoint, map_location="cpu")
+        ckpt = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
         pretrain_state = ckpt["model_state"]
         model_state = model.state_dict()
         loaded, skipped = 0, 0
