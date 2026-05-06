@@ -58,24 +58,31 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
             "cellxgene-census is required: pip install cellxgene-census"
         )
 
-    print("Querying CELLxGENE Census for human kidney cells...")
+    # Subsample obs IDs before downloading to avoid OOM on full 1.4M cells.
+    # The paper used ~800k cells; we cap at 800k (or 500 for smoke test).
+    n_target = 500 if smoke_test else 800_000
+    print(f"Querying CELLxGENE Census for human kidney cell IDs...")
+    census = cellxgene_census.open_soma()
+    obs_df = census["census_data"]["homo_sapiens"]["obs"].read(
+        value_filter="tissue_general == 'kidney' and is_primary_data == True",
+        column_names=["soma_joinid"],
+    ).concat().to_pandas()
+    census.close()
+    print(f"  Found {len(obs_df):,} kidney cells in Census")
+
+    rng = np.random.default_rng(42)
+    n_sample = min(n_target, len(obs_df))
+    sampled_ids = obs_df["soma_joinid"].sample(n=n_sample, random_state=42).tolist()
+    print(f"  Subsampling to {n_sample:,} cells...")
+
     census = cellxgene_census.open_soma()
     adata = cellxgene_census.get_anndata(
         census=census,
         organism="Homo sapiens",
-        obs_value_filter=(
-            "tissue_general == 'kidney' "
-            "and is_primary_data == True"
-        ),
+        obs_coords=sampled_ids,
     )
     census.close()
     print(f"  Downloaded {adata.n_obs:,} cells × {adata.n_vars:,} genes")
-
-    if smoke_test:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(adata.n_obs, min(500, adata.n_obs), replace=False)
-        adata = adata[idx].copy()
-        print(f"  [smoke test] Subsampled to {adata.n_obs} cells")
 
     # Basic QC
     sc.pp.filter_cells(adata, min_genes=200)
@@ -99,11 +106,13 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
         sc.pp.highly_variable_genes(adata, n_top_genes=N_HVG, flavor="seurat")
         adata = adata[:, adata.var.highly_variable].copy()
 
+    # Convert to dense only after subsetting to 2000 HVGs (safe: 800k × 2000 × 4 bytes = ~6 GB)
     import scipy.sparse as sp
     X = adata.X
     if sp.issparse(X):
         X = X.toarray()
     X = X.astype(np.float32)
+    print(f"  Dense matrix: {X.nbytes / 1e9:.1f} GB")
 
     # Drop cells with no expressed genes after HVG filtering
     expressed = (X > 0).any(axis=1)
