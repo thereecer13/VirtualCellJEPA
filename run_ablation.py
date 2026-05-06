@@ -77,6 +77,23 @@ def get_device(s: str | None) -> torch.device:
 # Cell-JEPA condition
 # ---------------------------------------------------------------------------
 
+def _train_test_split(
+    count_matrix: np.ndarray,
+    cell_types: np.ndarray,
+    test_frac: float = 0.2,
+    seed: int = 42,
+):
+    """80/20 stratified split — returns (X_train, y_train, X_test, y_test)."""
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(count_matrix.shape[0])
+    n_test = max(1, int(len(idx) * test_frac))
+    test_idx, train_idx = idx[:n_test], idx[n_test:]
+    return (
+        count_matrix[train_idx], cell_types[train_idx],
+        count_matrix[test_idx],  cell_types[test_idx],
+    )
+
+
 def run_cell_jepa(
     count_matrix: np.ndarray,
     cell_types: np.ndarray,
@@ -89,18 +106,21 @@ def run_cell_jepa(
     bs     = 8  if args.smoke_test else 32
     ft_bs  = 8  if args.smoke_test else 16
 
+    X_train, y_train, X_test, y_test = _train_test_split(count_matrix, cell_types)
+    print(f"  Train: {X_train.shape[0]} cells  |  Test (held-out): {X_test.shape[0]} cells")
+
     pretrain_ds = SingleCellDataset(
-        count_matrix, gene_vocab, np.zeros(count_matrix.shape[0], dtype=np.int32),
+        X_train, gene_vocab, np.zeros(X_train.shape[0], dtype=np.int32),
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.15,
     )
     finetune_ds = SingleCellDataset(
-        count_matrix, gene_vocab, cell_types,
+        X_train, gene_vocab, y_train,
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.40,
     )
     eval_ds = SingleCellDataset(
-        count_matrix, gene_vocab, cell_types,
+        X_test, gene_vocab, y_test,
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.0,
     )
@@ -166,18 +186,21 @@ def run_sigreg_transformer(
     bs     = 8   if args.smoke_test else 128
     ft_bs  = 8   if args.smoke_test else 64
 
+    X_train, y_train, X_test, y_test = _train_test_split(count_matrix, cell_types)
+    print(f"  Train: {X_train.shape[0]} cells  |  Test (held-out): {X_test.shape[0]} cells")
+
     pretrain_ds = SingleCellDataset(
-        count_matrix, gene_vocab, np.zeros(count_matrix.shape[0], dtype=np.int32),
+        X_train, gene_vocab, np.zeros(X_train.shape[0], dtype=np.int32),
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.15,
     )
     finetune_ds = SingleCellDataset(
-        count_matrix, gene_vocab, cell_types,
+        X_train, gene_vocab, y_train,
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.40,
     )
     eval_ds = SingleCellDataset(
-        count_matrix, gene_vocab, cell_types,
+        X_test, gene_vocab, y_test,
         n_bins=n_bins, L_max=args.l_max,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.0,
     )
