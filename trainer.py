@@ -154,7 +154,7 @@ class Pretrainer:
         Restore a Pretrainer from a checkpoint saved by .save().
         Training will resume from the epoch after the one that was saved.
         """
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         trainer = cls(model, dataset, config=ckpt["config"], device=device)
         model.load_state_dict(ckpt["model_state"])
         trainer.optimizer.load_state_dict(ckpt["optimizer_state"])
