@@ -180,6 +180,11 @@ def main():
     )
     print(f"Using device: {device}")
 
+    def gpu_mb():
+        if device.type == "cuda":
+            return torch.cuda.memory_allocated() / 1e9
+        return 0.0
+
     # ------------------------------------------------------------------
     # Load kidney data
     # ------------------------------------------------------------------
@@ -200,6 +205,7 @@ def main():
     # ------------------------------------------------------------------
     # Build dataset and model
     # ------------------------------------------------------------------
+    print(f"GPU memory before dataset init: {gpu_mb():.2f} GB")
     n_genes = X.shape[1]
     # Token IDs: 0=<cls>, 1=<pad>, 2..n_genes+1=genes
     gene_vocab = {i: i + 2 for i in range(n_genes)}
@@ -213,6 +219,7 @@ def main():
         n_bins=50, L_max=600,
         cls_token_id=0, pad_token_id=1, mask_ratio=0.15,
     )
+    print(f"GPU memory after dataset init: {gpu_mb():.2f} GB")
 
     model = CellJEPA(
         vocab_size=vocab_size, n_bins=50,
@@ -221,6 +228,7 @@ def main():
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"CellJEPA: {n_params / 1e6:.1f}M trainable parameters")
+    print(f"GPU memory after model init (CPU): {gpu_mb():.2f} GB")
 
     # ------------------------------------------------------------------
     # Build or resume trainer
@@ -234,7 +242,7 @@ def main():
         mask_ratio=0.15,
         w_rec=1.0,
         w_jepa=1000.0,
-        num_workers=2,
+        num_workers=0,
         log_every=50,
     )
 
@@ -247,6 +255,8 @@ def main():
         trainer.config.n_epochs = args.n_epochs
     else:
         trainer = Pretrainer(model, dataset, config=config, device=device)
+
+    print(f"GPU memory after trainer init (model on GPU): {gpu_mb():.2f} GB")
 
     # ------------------------------------------------------------------
     # Train with per-epoch checkpoint saves to Drive

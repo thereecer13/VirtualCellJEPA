@@ -176,17 +176,21 @@ class Pretrainer:
         Returns:
             List of per-epoch metric dicts.
         """
+        use_pin = torch.cuda.is_available() and self.config.num_workers > 0
         loader = DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=use_pin,
         )
+
+        use_amp = self.device.type == "cuda"
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         for epoch in range(self._start_epoch, self.config.n_epochs + 1):
             self._current_epoch = epoch
-            metrics = self._train_epoch(epoch, loader)
+            metrics = self._train_epoch(epoch, loader, scaler, use_amp)
             self.scheduler.step()
             self._history.append(metrics)
             print(
@@ -200,7 +204,8 @@ class Pretrainer:
                 epoch_callback(epoch)
         return self._history
 
-    def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
+    def _train_epoch(self, epoch: int, loader: DataLoader,
+                     scaler=None, use_amp: bool = False) -> dict:
         self.model.train()
         total_loss = total_jepa = total_rec = 0.0
         n_steps = 0
@@ -211,25 +216,28 @@ class Pretrainer:
 
             self.optimizer.zero_grad()
 
-            out = self.model(
-                gene_ids=batch["gene_ids"],
-                values=batch["values"],
-                masked_vals=batch["masked_vals"],
-                is_masked=batch["mask"],
-                is_pad=batch["padding"],
-            )
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                out = self.model(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    masked_vals=batch["masked_vals"],
+                    is_masked=batch["mask"],
+                    is_pad=batch["padding"],
+                )
 
-            loss_dict = self.criterion(
-                model_out=out,
-                target_values=batch["values"],
-                is_masked=batch["mask"],
-            )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=batch["values"],
+                    is_masked=batch["mask"],
+                )
 
-            loss_dict["loss"].backward()
+            scaler.scale(loss_dict["loss"]).backward()
+            scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.grad_clip
             )
-            self.optimizer.step()
+            scaler.step(self.optimizer)
+            scaler.update()
 
             # EMA teacher update (after each gradient step)
             self.model.update_teacher()
