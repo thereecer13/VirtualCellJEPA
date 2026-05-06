@@ -20,6 +20,8 @@ Delta-perturbation objective (this project):
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -518,4 +520,225 @@ class DeltaPerturbationLoss(nn.Module):
             "l_delta":     l_delta.detach(),
             "l_jepa_pert": l_jepa_pert.detach(),
             "l_ecs":       l_ecs.detach(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Loss  (Balestriero & LeCun 2025, LeJEPA)
+# ---------------------------------------------------------------------------
+
+def _epps_pulley(u: torch.Tensor) -> torch.Tensor:
+    """
+    Closed-form Epps-Pulley statistic for 1D projections u of shape (N,).
+
+    Measures deviation of the projected distribution from a standard normal
+    using the characteristic-function test with Gaussian weighting w(t)=exp(-t²).
+
+    TEP = (1/sqrt(3)) * [
+        (2/N) * Σ_{i,j} exp(-(u_i - u_j)²/4)
+        - 2*sqrt(2) * Σ_i exp(-u_i²/3)
+        + N
+    ]  / N
+
+    Normalised by N to be batch-size independent.
+    """
+    N = u.shape[0]
+    diff = u.unsqueeze(0) - u.unsqueeze(1)               # (N, N) pairwise diffs
+    pairwise_term = torch.exp(-diff.pow(2) / 4).mean()   # (1/N²) Σ_{i,j}
+    marginal_term = torch.exp(-u.pow(2) / 3).mean()      # (1/N) Σ_i
+    # Factor N/sqrt(3) * (2*pairwise - 2*sqrt(2)*marginal + 1), then /N
+    return (1.0 / math.sqrt(3)) * (
+        2.0 * pairwise_term - 2.0 * math.sqrt(2) * marginal_term + 1.0
+    )
+
+
+def sigreg_loss(Z: torch.Tensor, M: int = 256) -> torch.Tensor:
+    """
+    SIGReg loss: average Epps-Pulley statistic over M random 1D projections.
+
+    Measures how far the distribution of embeddings deviates from an isotropic
+    Gaussian. Minimising this encourages the embeddings to fill the space
+    uniformly, preventing representational collapse.
+
+    Args:
+        Z: (N, K) embedding matrix — all views concatenated along the batch dim
+        M: number of random projection directions (default 256)
+
+    Returns:
+        Scalar loss (lower = more Gaussian = less collapse).
+
+    ⚠ HYPERPARAMETER NOTE: M=256 is a starting point for K=512-dim embeddings.
+      M=512 may give better distributional coverage at modest compute cost.
+    """
+    N, K = Z.shape
+    # Sample M unit-norm random directions on the (K-1)-sphere
+    A = F.normalize(torch.randn(K, M, device=Z.device, dtype=Z.dtype), dim=0)
+    U = Z @ A                                             # (N, M) projections
+    total = torch.stack([_epps_pulley(U[:, m]) for m in range(M)]).mean()
+    return total
+
+
+def sim_loss(
+    e_global: torch.Tensor,
+    e_views: list[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Similarity loss: mean squared L2 distance between the global CLS embedding
+    and each masked-view CLS embedding, computed on L2-normalised vectors.
+
+    L_sim = (1/V) * Σ_v ||norm(e_global) - norm(e_view_v)||²
+
+    This is equivalent to 2*(1 - cosine_similarity) and encourages the masked
+    views to produce the same cell-level representation as the global view.
+
+    Args:
+        e_global: (B, D) global view CLS embeddings
+        e_views:  list of V (B, D) masked view CLS embeddings
+
+    Returns:
+        Scalar loss.
+    """
+    e_g = F.normalize(e_global, dim=-1)   # (B, D)
+    total = e_global.new_tensor(0.0)
+    for e_v in e_views:
+        e_v_norm = F.normalize(e_v, dim=-1)
+        total = total + (e_g - e_v_norm).pow(2).sum(-1).mean()
+    return total / max(len(e_views), 1)
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Pre-training Loss
+# ---------------------------------------------------------------------------
+
+class SIGRegPretrainingLoss(nn.Module):
+    """
+    L = w_sim * L_sim + w_sigreg * L_SIGReg + w_rec * L_rec
+
+    L_sim    : similarity between global and masked-view CLS embeddings
+    L_SIGReg : SIGReg on all CLS embeddings (global + all views concatenated)
+    L_rec    : gene-level reconstruction MSE on global view (masked positions)
+
+    ⚠ HYPERPARAMETER NOTE: w_sigreg (λ) and w_rec (γ) are the most sensitive
+      parameters. Defaults (0.5, 1.0) are starting points.
+      Recommended sweep: λ ∈ {0.1, 0.5, 0.9} × γ ∈ {0.1, 1.0, 10.0}.
+    """
+
+    def __init__(
+        self,
+        w_sim: float = 1.0,
+        w_sigreg: float = 0.5,
+        w_rec: float = 1.0,
+        n_directions: int = 256,
+    ):
+        super().__init__()
+        self.w_sim = w_sim
+        self.w_sigreg = w_sigreg
+        self.w_rec = w_rec
+        self.n_directions = n_directions
+
+    def forward(
+        self,
+        model_out: dict,
+        target_values: torch.LongTensor,
+        is_masked: torch.BoolTensor,
+    ) -> dict:
+        """
+        Args:
+            model_out:     Output dict from CellJEPA_SIGReg.forward()
+            target_values: (B, L) ground-truth bin indices (global view)
+            is_masked:     (B, L) True at masked positions in global view
+                           (used only for reconstruction loss; SIGReg uses all)
+
+        Returns:
+            Dict with 'loss', 'l_sim', 'l_sigreg', 'l_rec'.
+        """
+        e_global = model_out["e_global"]    # (B, D)
+        e_views  = model_out["e_views"]     # list of (B, D)
+
+        l_sim = sim_loss(e_global, e_views)
+
+        # Concatenate all view embeddings for SIGReg
+        all_emb = torch.cat([e_global] + e_views, dim=0)   # (B*(V+1), D)
+        l_sigreg = sigreg_loss(all_emb, M=self.n_directions)
+
+        l_rec = reconstruction_loss(model_out["v_hat"], target_values, is_masked)
+
+        total = self.w_sim * l_sim + self.w_sigreg * l_sigreg + self.w_rec * l_rec
+
+        return {
+            "loss":     total,
+            "l_sim":    l_sim.detach(),
+            "l_sigreg": l_sigreg.detach(),
+            "l_rec":    l_rec.detach(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Fine-tuning Loss
+# ---------------------------------------------------------------------------
+
+class SIGRegFinetuningLoss(nn.Module):
+    """
+    L = w_gep*L_gep + w_gepc*L_gepc + w_ecs*L_ecs + w_sim*L_sim + w_sigreg*L_SIGReg
+
+    Analogous to FinetuningLoss but replaces the JEPA cosine objective with
+    L_sim + L_SIGReg. ECS uses the global view CLS embedding (e_global).
+    """
+
+    def __init__(
+        self,
+        w_gep: float = 1.0,
+        w_gepc: float = 1.0,
+        w_ecs: float = 1.0,
+        w_sim: float = 1.0,
+        w_sigreg: float = 0.5,
+        ecs_temperature: float = 0.1,
+        n_directions: int = 256,
+    ):
+        super().__init__()
+        self.w_gep = w_gep
+        self.w_gepc = w_gepc
+        self.w_ecs = w_ecs
+        self.w_sim = w_sim
+        self.w_sigreg = w_sigreg
+        self.ecs_temperature = ecs_temperature
+        self.n_directions = n_directions
+
+    def forward(
+        self,
+        model_out: dict,
+        target_values: torch.LongTensor,
+        is_masked: torch.BoolTensor,
+        cell_types: Optional[torch.LongTensor] = None,
+    ) -> dict:
+        l_gep  = reconstruction_loss(model_out["v_hat"], target_values, is_masked)
+        l_gepc = gepc_loss(model_out["gepc_scores"], target_values, is_masked)
+
+        l_ecs = (
+            ecs_loss(model_out["e_global"], cell_types, self.ecs_temperature)
+            if cell_types is not None
+            else model_out["e_global"].new_tensor(0.0)
+        )
+
+        e_views = model_out.get("e_views", [])
+        l_sim = sim_loss(model_out["e_global"], e_views) if e_views else model_out["e_global"].new_tensor(0.0)
+
+        all_emb = torch.cat([model_out["e_global"]] + e_views, dim=0)
+        l_sigreg = sigreg_loss(all_emb, M=self.n_directions)
+
+        total = (
+            self.w_gep     * l_gep
+            + self.w_gepc  * l_gepc
+            + self.w_ecs   * l_ecs
+            + self.w_sim   * l_sim
+            + self.w_sigreg * l_sigreg
+        )
+
+        return {
+            "loss":     total,
+            "l_gep":    l_gep.detach(),
+            "l_gepc":   l_gepc.detach(),
+            "l_ecs":    l_ecs.detach(),
+            "l_sim":    l_sim.detach(),
+            "l_sigreg": l_sigreg.detach(),
         }

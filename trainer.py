@@ -30,7 +30,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
 from cell_jepa import CellJEPA
-from losses import PretrainingLoss, FinetuningLoss, PerturbationLoss, DeltaPerturbationLoss
+from losses import (
+    PretrainingLoss, FinetuningLoss, PerturbationLoss, DeltaPerturbationLoss,
+    SIGRegPretrainingLoss, SIGRegFinetuningLoss,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -626,3 +629,418 @@ class PerturbationTrainer:
             path,
         )
         print(f"Perturbation checkpoint saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Pre-training Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SIGRegPretrainConfig:
+    # Optimizer
+    lr: float = 1e-4
+    weight_decay: float = 2e-4
+    lr_decay: float = 0.9
+    warmup_steps: int = 1000       # linear LR warmup (no EMA stabilisation)
+
+    # Data
+    batch_size: int = 128
+    mask_ratio: float = 0.15
+    num_workers: int = 0
+
+    # Training
+    n_epochs: int = 4
+    grad_clip: float = 1.0
+    log_every: int = 50
+
+    # SIGReg-specific
+    n_views: int = 2               # masked views per cell per step
+
+    # Loss weights — ⚠ most sensitive hyperparameters, sweep before concluding
+    w_sim: float = 1.0
+    w_sigreg: float = 0.5          # λ: sweep {0.1, 0.5, 0.9}
+    w_rec: float = 1.0             # γ: sweep {0.1, 1.0, 10.0}
+    n_directions: int = 256        # M: may need 512 for 512-dim embeddings
+
+
+@dataclass
+class SIGRegFinetuneConfig:
+    # Optimizer
+    lr: float = 1e-4
+    lr_decay: float = 0.9
+
+    # Data
+    batch_size: int = 64
+    mask_ratio: float = 0.40
+    val_split: float = 0.1
+    num_workers: int = 0
+
+    # Training
+    n_epochs: int = 30
+    grad_clip: float = 1.0
+    log_every: int = 20
+
+    # Loss weights
+    w_gep: float = 1.0
+    w_gepc: float = 1.0
+    w_ecs: float = 1.0
+    w_sim: float = 1.0
+    w_sigreg: float = 0.5
+    ecs_temperature: float = 0.1
+    n_directions: int = 256
+    n_views: int = 2
+
+
+# ---------------------------------------------------------------------------
+# Mask sampling helper
+# ---------------------------------------------------------------------------
+
+def _sample_mask(
+    values: torch.LongTensor,
+    is_pad: torch.BoolTensor,
+    mask_ratio: float,
+) -> tuple[torch.LongTensor, torch.BoolTensor]:
+    """
+    Sample a new random mask for a batch, returning masked_vals and is_masked.
+
+    Args:
+        values:     (B, L) bin indices (original unmasked)
+        is_pad:     (B, L) True at padding positions
+        mask_ratio: fraction of expressed (non-pad, non-cls) tokens to mask
+
+    Returns:
+        masked_vals: (B, L) values with masked positions set to -1
+        is_masked:   (B, L) bool, True at newly masked positions
+    """
+    B, L = values.shape
+    masked_vals = values.clone()
+    is_masked = torch.zeros(B, L, dtype=torch.bool, device=values.device)
+
+    for b in range(B):
+        # Positions eligible for masking: not padding, not CLS (pos 0)
+        eligible = (~is_pad[b]).clone()
+        eligible[0] = False                              # protect <cls>
+        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(1)
+        n_eligible = eligible_idx.shape[0]
+        if n_eligible == 0:
+            continue
+        n_mask = max(1, int(mask_ratio * n_eligible))
+        perm = torch.randperm(n_eligible, device=values.device)[:n_mask]
+        mask_idx = eligible_idx[perm]
+        masked_vals[b, mask_idx] = -1
+        is_masked[b, mask_idx] = True
+
+    return masked_vals, is_masked
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Pre-training Trainer
+# ---------------------------------------------------------------------------
+
+class SIGRegPretrainer:
+    """
+    Runs CellJEPA_SIGReg pre-training.
+
+    Generates n_views independent masked views per batch step by re-sampling
+    random masks from the stored binned values — no dataset change required.
+
+    ⚠ INSTABILITY NOTE: Without EMA, e_global changes every step. Watch l_sim
+      in the first 5K steps. If erratic, increase warmup_steps to 5000.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataset,
+        config: SIGRegPretrainConfig = SIGRegPretrainConfig(),
+        device: Optional[torch.device] = None,
+    ):
+        self.model = model
+        self.dataset = dataset
+        self.config = config
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.model.to(self.device)
+
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+
+        # LR warmup then exponential decay
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=config.warmup_steps,
+        )
+        decay = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer, gamma=config.lr_decay
+        )
+        self.scheduler_warmup = warmup
+        self.scheduler_decay = decay
+        self._global_step = 0
+
+        self.criterion = SIGRegPretrainingLoss(
+            w_sim=config.w_sim,
+            w_sigreg=config.w_sigreg,
+            w_rec=config.w_rec,
+            n_directions=config.n_directions,
+        )
+        self._history: list[dict] = []
+
+    def train(self, epoch_callback=None) -> list[dict]:
+        use_pin = torch.cuda.is_available() and self.config.num_workers > 0
+        loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=use_pin,
+        )
+
+        use_amp = self.device.type == "cuda"
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+        for epoch in range(1, self.config.n_epochs + 1):
+            metrics = self._train_epoch(epoch, loader, scaler, use_amp)
+            self.scheduler_decay.step()
+            self._history.append(metrics)
+            print(
+                f"[Epoch {epoch}/{self.config.n_epochs}]  "
+                f"loss={metrics['loss']:.4f}  "
+                f"l_sim={metrics['l_sim']:.4f}  "
+                f"l_sigreg={metrics['l_sigreg']:.6f}  "
+                f"l_rec={metrics['l_rec']:.4f}"
+            )
+            if epoch_callback is not None:
+                epoch_callback(epoch)
+        return self._history
+
+    def _train_epoch(
+        self, epoch: int, loader: DataLoader,
+        scaler, use_amp: bool,
+    ) -> dict:
+        self.model.train()
+        total = {"loss": 0.0, "l_sim": 0.0, "l_sigreg": 0.0, "l_rec": 0.0}
+        n_steps = 0
+        t0 = time.time()
+
+        for step, batch in enumerate(loader, 1):
+            batch = batch_to_device(batch, self.device)
+            values = batch["values"]
+            is_pad = batch["padding"]
+
+            # Generate n_views independent random masks on the fly
+            masked_vals_list, is_masked_list = [], []
+            for _ in range(self.config.n_views):
+                mv, im = _sample_mask(values, is_pad, self.config.mask_ratio)
+                masked_vals_list.append(mv)
+                is_masked_list.append(im)
+
+            self.optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                out = self.model(
+                    gene_ids=batch["gene_ids"],
+                    values=values,
+                    masked_vals_list=masked_vals_list,
+                    is_masked_list=is_masked_list,
+                    is_pad=is_pad,
+                )
+                # Use the first view's mask for the reconstruction loss target
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=values,
+                    is_masked=is_masked_list[0],
+                )
+
+            scaler.scale(loss_dict["loss"]).backward()
+            scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            scaler.step(self.optimizer)
+            scaler.update()
+
+            # LR warmup
+            self._global_step += 1
+            if self._global_step <= self.config.warmup_steps:
+                self.scheduler_warmup.step()
+
+            for k in total:
+                total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
+            n_steps += 1
+
+            if step % self.config.log_every == 0:
+                elapsed = time.time() - t0
+                print(
+                    f"  Epoch {epoch} | Step {step}/{len(loader)} | "
+                    f"loss={total['loss']/n_steps:.4f} | "
+                    f"l_sim={total['l_sim']/n_steps:.4f} | "
+                    f"l_sigreg={total['l_sigreg']/n_steps:.6f} | "
+                    f"l_rec={total['l_rec']/n_steps:.4f} | "
+                    f"{elapsed:.1f}s elapsed"
+                )
+
+        return {k: v / n_steps for k, v in total.items()}
+
+    def save(self, path: str):
+        torch.save(
+            {
+                "model_state": self.model.state_dict(),
+                "optimizer_state": self.optimizer.state_dict(),
+                "config": self.config,
+                "history": self._history,
+                "global_step": self._global_step,
+            },
+            path,
+        )
+        print(f"SIGReg checkpoint saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Fine-tuning Trainer
+# ---------------------------------------------------------------------------
+
+class SIGRegFinetuner:
+    """
+    Fine-tunes CellJEPA_SIGReg on labelled data (cell-type clustering).
+
+    Generates n_views masked views per step (same as SIGRegPretrainer).
+    Adds ECS loss on global CLS embeddings using cell-type labels.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataset,
+        config: SIGRegFinetuneConfig = SIGRegFinetuneConfig(),
+        device: Optional[torch.device] = None,
+    ):
+        self.model = model
+        self.dataset = dataset
+        self.config = config
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.model.to(self.device)
+
+        n_val = int(len(dataset) * config.val_split)
+        n_train = len(dataset) - n_val
+        self.train_dataset, self.val_dataset = random_split(
+            dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer, gamma=config.lr_decay
+        )
+        self.criterion = SIGRegFinetuningLoss(
+            w_gep=config.w_gep,
+            w_gepc=config.w_gepc,
+            w_ecs=config.w_ecs,
+            w_sim=config.w_sim,
+            w_sigreg=config.w_sigreg,
+            ecs_temperature=config.ecs_temperature,
+            n_directions=config.n_directions,
+        )
+
+    def train(self) -> list[dict]:
+        train_loader = DataLoader(
+            self.train_dataset, batch_size=self.config.batch_size,
+            shuffle=True, num_workers=self.config.num_workers,
+        )
+        val_loader = DataLoader(
+            self.val_dataset, batch_size=self.config.batch_size,
+            shuffle=False, num_workers=self.config.num_workers,
+        )
+
+        history = []
+        for epoch in range(1, self.config.n_epochs + 1):
+            train_m = self._train_epoch(epoch, train_loader)
+            val_m   = self._val_epoch(val_loader)
+            self.scheduler.step()
+            metrics = {**{f"train_{k}": v for k, v in train_m.items()},
+                       **{f"val_{k}":   v for k, v in val_m.items()}}
+            history.append(metrics)
+            print(
+                f"[Epoch {epoch}/{self.config.n_epochs}]  "
+                f"train_loss={metrics['train_loss']:.4f}  "
+                f"val_loss={metrics['val_loss']:.4f}"
+            )
+        return history
+
+    def _forward_batch(self, batch: dict) -> tuple[dict, dict]:
+        """Run forward pass, generating masked views on the fly."""
+        values = batch["values"]
+        is_pad = batch["padding"]
+        masked_vals_list, is_masked_list = [], []
+        for _ in range(self.config.n_views):
+            mv, im = _sample_mask(values, is_pad, self.config.mask_ratio)
+            masked_vals_list.append(mv)
+            is_masked_list.append(im)
+        out = self.model(
+            gene_ids=batch["gene_ids"],
+            values=values,
+            masked_vals_list=masked_vals_list,
+            is_masked_list=is_masked_list,
+            is_pad=is_pad,
+        )
+        return out, {"values": values, "is_masked": is_masked_list[0],
+                     "cell_type": batch.get("cell_type")}
+
+    def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
+        self.model.train()
+        keys = ["loss", "l_gep", "l_gepc", "l_ecs", "l_sim", "l_sigreg"]
+        total = {k: 0.0 for k in keys}
+        n = 0
+        for batch in loader:
+            batch = batch_to_device(batch, self.device)
+            self.optimizer.zero_grad()
+            out, aux = self._forward_batch(batch)
+            loss_dict = self.criterion(
+                model_out=out,
+                target_values=aux["values"],
+                is_masked=aux["is_masked"],
+                cell_types=aux["cell_type"],
+            )
+            loss_dict["loss"].backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.optimizer.step()
+            for k in total:
+                total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
+            n += 1
+        return {k: v / n for k, v in total.items()}
+
+    @torch.no_grad()
+    def _val_epoch(self, loader: DataLoader) -> dict:
+        self.model.eval()
+        keys = ["loss", "l_gep", "l_gepc", "l_ecs", "l_sim", "l_sigreg"]
+        total = {k: 0.0 for k in keys}
+        n = 0
+        for batch in loader:
+            batch = batch_to_device(batch, self.device)
+            out, aux = self._forward_batch(batch)
+            loss_dict = self.criterion(
+                model_out=out,
+                target_values=aux["values"],
+                is_masked=aux["is_masked"],
+                cell_types=aux["cell_type"],
+            )
+            for k in total:
+                total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
+            n += 1
+        return {k: v / n for k, v in total.items()}
+
+    def save(self, path: str):
+        torch.save(
+            {
+                "model_state": self.model.state_dict(),
+                "optimizer_state": self.optimizer.state_dict(),
+                "config": self.config,
+            },
+            path,
+        )
+        print(f"SIGReg fine-tune checkpoint saved to {path}")
