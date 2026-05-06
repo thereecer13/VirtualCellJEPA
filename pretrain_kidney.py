@@ -67,7 +67,6 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
             "tissue_general == 'kidney' "
             "and is_primary_data == True"
         ),
-        var_value_filter="feature_biotype == 'gene'",
     )
     census.close()
     print(f"  Downloaded {adata.n_obs:,} cells × {adata.n_vars:,} genes")
