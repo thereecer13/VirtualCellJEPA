@@ -29,3 +29,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
+
+# Virtual environments
+.venv-1/
+.venv/
+
+# macOS
+.DS_Store

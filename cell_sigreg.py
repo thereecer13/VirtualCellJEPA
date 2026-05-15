@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from cell_jepa import (
     ValueEmbedding,
@@ -46,14 +47,16 @@ class CellJEPA_SIGReg(nn.Module):
     - update_teacher() method
 
     Args:
-        vocab_size:  Total gene vocabulary size (incl. special tokens).
-        n_bins:      Expression quantile bins (default 50).
-        d_model:     Hidden dimension (default 512).
-        n_layers:    Transformer depth (default 12).
-        n_heads:     Attention heads (default 8).
-        ffn_dim:     FFN hidden dim (default 2048).
-        dropout:     Dropout probability (default 0.2).
-        n_views:     Number of masked views per forward call (default 2).
+        vocab_size:       Total gene vocabulary size (incl. special tokens).
+        n_bins:           Expression quantile bins (default 50).
+        d_model:          Hidden dimension (default 512).
+        n_layers:         Transformer depth (default 12).
+        n_heads:          Attention heads (default 8).
+        ffn_dim:          FFN hidden dim (default 2048).
+        dropout:          Dropout probability (default 0.2).
+        n_views:          Number of masked views per forward call (default 2).
+        n_perturbations:  Perturbation vocab size; 0 disables perturbation heads.
+        predict_delta:    If True, adds a delta regression head for Δ prediction.
     """
 
     def __init__(
@@ -66,12 +69,18 @@ class CellJEPA_SIGReg(nn.Module):
         ffn_dim: int = 2048,
         dropout: float = 0.2,
         n_views: int = 2,
+        grad_checkpoint: bool = False,
+        n_perturbations: int = 0,
+        predict_delta: bool = False,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.n_bins = n_bins
         self.n_views = n_views
+        self.grad_checkpoint = grad_checkpoint
+        self.n_perturbations = n_perturbations
+        self.predict_delta = predict_delta
 
         # --- Tokenization & Embeddings ---
         self.gene_embedding = nn.Embedding(vocab_size, d_model)
@@ -95,6 +104,21 @@ class CellJEPA_SIGReg(nn.Module):
         )
         self.gepc_W = nn.Parameter(torch.randn(d_model, d_model) * 0.02)
 
+        # --- Perturbation heads (optional) ---
+        if n_perturbations > 0:
+            self.perturb_embedding = nn.Embedding(n_perturbations, d_model)
+            self.perturb_value_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, n_bins + 1),
+            )
+            if predict_delta:
+                self.delta_head = nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.ReLU(),
+                    nn.Linear(d_model // 2, 1),
+                )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -116,6 +140,16 @@ class CellJEPA_SIGReg(nn.Module):
     ) -> torch.Tensor:
         """z_i = f_gene(y_i) + f_val(v_i)  →  (B, L, d_model)"""
         return self.gene_embedding(gene_ids) + self.value_embedding(values)
+
+    def _encode(self, Z, attn_mask, key_padding_mask):
+        """Encoder call, optionally with activation checkpointing."""
+        if self.grad_checkpoint and self.training:
+            # Checkpoint each transformer layer individually to minimise peak memory.
+            x = Z
+            for layer in self.encoder.layers:
+                x = checkpoint(layer, x, attn_mask, key_padding_mask, use_reentrant=False)
+            return self.encoder.final_norm(x)
+        return self.encoder(Z, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
     def forward(
         self,
@@ -144,7 +178,7 @@ class CellJEPA_SIGReg(nn.Module):
         """
         # --- Global (unmasked) view ---
         Z_global = self.embed(gene_ids, values)
-        H_global = self.encoder(Z_global, key_padding_mask=is_pad)
+        H_global = self._encode(Z_global, None, is_pad)
         e_global = H_global[:, 0, :]       # (B, D) CLS
 
         # --- Masked views (shared encoder, no stop-grad) ---
@@ -152,9 +186,7 @@ class CellJEPA_SIGReg(nn.Module):
         for masked_vals, is_masked in zip(masked_vals_list, is_masked_list):
             attn_mask = build_attention_mask(is_masked, is_pad)
             Z_view = self.embed(gene_ids, masked_vals)
-            H_view = self.encoder(
-                Z_view, attn_mask=attn_mask, key_padding_mask=is_pad
-            )
+            H_view = self._encode(Z_view, attn_mask, is_pad)
             e_views.append(H_view[:, 0, :])   # (B, D) CLS per view
 
         # --- Reconstruction head (from global view) ---
@@ -172,6 +204,70 @@ class CellJEPA_SIGReg(nn.Module):
             "gepc_scores": gepc_scores,
             "H_global":    H_global,
         }
+
+    def forward_perturb(
+        self,
+        gene_ids: torch.LongTensor,
+        values: torch.LongTensor,
+        pert_ids: torch.LongTensor,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+    ) -> dict:
+        """
+        Forward pass for perturbation fine-tuning (single encoder, no teacher).
+
+        The encoder sees control expression + perturbation embedding and predicts
+        the post-perturbation state. Unlike CellJEPA, there is no EMA teacher,
+        so no e_pert / e_tilde_pert targets are produced.
+
+        Args:
+            gene_ids:    (B, L) gene vocabulary IDs
+            values:      (B, L) baseline (control) bin indices
+            pert_ids:    (B, L) perturbation vocabulary IDs (0 = no perturbation)
+            pert_values: (B, L) ground-truth post-perturbation bin indices (unused
+                         in forward; kept for API compatibility with CellJEPA)
+            is_pad:      (B, L) True at padding positions
+
+        Returns dict with keys:
+            e_hat_pert  : (B, D) CLS embedding
+            v_hat_pert  : (B, L, n_bins+1) reconstruction logits
+            H_hat_pert  : (B, L, D) hidden states
+        """
+        if self.n_perturbations == 0:
+            raise RuntimeError(
+                "forward_perturb requires n_perturbations > 0 at model init."
+            )
+        p = self.perturb_embedding(pert_ids)              # (B, L, D)
+        Z = self.embed(gene_ids, values) + p              # ctrl + pert embedding
+        H = self._encode(Z, attn_mask=None, key_padding_mask=is_pad)
+        e_hat = H[:, 0, :]                                # (B, D) CLS
+        v_hat_pert = self.perturb_value_head(H)           # (B, L, n_bins+1)
+        return {"e_hat_pert": e_hat, "v_hat_pert": v_hat_pert, "H_hat_pert": H}
+
+    def forward_perturb_delta(
+        self,
+        gene_ids: torch.LongTensor,
+        values: torch.LongTensor,
+        pert_ids: torch.LongTensor,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+    ) -> dict:
+        """
+        Like forward_perturb() but also predicts Δ = pert_bins − ctrl_bins
+        as a direct scalar regression per gene token.
+
+        Requires predict_delta=True at model init.
+
+        Returns same keys as forward_perturb() plus:
+            delta_hat: (B, L) scalar delta predictions
+        """
+        if not self.predict_delta:
+            raise RuntimeError(
+                "forward_perturb_delta requires predict_delta=True at model init."
+            )
+        out = self.forward_perturb(gene_ids, values, pert_ids, pert_values, is_pad)
+        delta_hat = self.delta_head(out["H_hat_pert"]).squeeze(-1)  # (B, L)
+        return {**out, "delta_hat": delta_hat}
 
     @torch.no_grad()
     def encode(

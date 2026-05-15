@@ -121,7 +121,14 @@ def load_kidney_data(smoke_test: bool = False, gene_list: list[str] | None = Non
         print(f"  Dropping {n_dropped} cells with zero expressed HVGs")
         X = X[expressed]
 
-    gene_names = list(adata.var_names)
+    # Census var_names are Ensembl IDs; use feature_name (gene symbols) for
+    # cross-dataset alignment with PBMC-3K which uses gene symbols.
+    if "feature_name" in adata.var.columns:
+        gene_names = list(adata.var["feature_name"].astype(str))
+        print(f"  Using feature_name (gene symbols) for alignment, e.g. {gene_names[:3]}")
+    else:
+        gene_names = list(adata.var_names)
+        print(f"  Warning: feature_name column not found, using var_names (may be Ensembl IDs)")
     print(f"  Final: {X.shape[0]:,} cells × {X.shape[1]:,} HVGs")
     if X.shape[0] == 0:
         raise RuntimeError("No cells remaining after QC and HVG filtering — check Census data format.")

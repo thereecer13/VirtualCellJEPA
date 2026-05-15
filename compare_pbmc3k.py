@@ -141,6 +141,83 @@ def load_pbmc3k(
     return count_matrix, int_labels, label_names, adata_raw, list(adata_raw.var_names)
 
 
+def load_pbmc3k_universal(
+    universal_gene_names: list[str],
+    n_cells_subset: int | None = None,
+    seed: int = 42,
+):
+    """
+    Load PBMC3k aligned to a pre-built universal gene vocabulary.
+
+    Instead of selecting HVGs, this returns the full expression matrix
+    re-indexed to match universal_gene_names order (zeros for missing genes).
+    Genes not present in PBMC-3K are set to zero for all cells.
+
+    This is the evaluation counterpart to pretrain_universal.py — both use
+    the same token IDs so no gene alignment is needed at fine-tuning time.
+
+    Args:
+        universal_gene_names: Ordered list of gene symbols in the universal vocab.
+        n_cells_subset: Optional subsample for smoke test.
+        seed: RNG seed for subsample.
+
+    Returns:
+        count_matrix : (N, len(universal_gene_names)) float32
+        int_labels   : (N,)  int32 cell-type indices
+        label_names  : list of label strings
+        adata_raw    : AnnData (for optional scGPT evaluation)
+        universal_gene_names : the same list passed in (for convenience)
+    """
+    import scipy.sparse as sp
+
+    print("Loading PBMC3k (universal vocab) …")
+    adata_raw  = sc.datasets.pbmc3k()
+    adata_proc = sc.datasets.pbmc3k_processed()
+
+    common = adata_raw.obs_names.intersection(adata_proc.obs_names)
+    adata_raw  = adata_raw[common].copy()
+    adata_proc = adata_proc[common]
+
+    labels_str  = adata_proc.obs["louvain"].values
+    label_names = sorted(set(labels_str))
+    lbl2int     = {l: i for i, l in enumerate(label_names)}
+    int_labels  = np.array([lbl2int[l] for l in labels_str], dtype=np.int32)
+
+    sc.pp.normalize_total(adata_raw, target_sum=1e4)
+    sc.pp.log1p(adata_raw)
+
+    # Project PBMC-3K genes into universal vocab space
+    pbmc_gene_set = {g: i for i, g in enumerate(adata_raw.var_names)}
+    n_universal = len(universal_gene_names)
+    n_cells = adata_raw.n_obs
+
+    X = adata_raw.X
+    if sp.issparse(X):
+        X = X.toarray()
+    X = X.astype(np.float32)
+
+    X_universal = np.zeros((n_cells, n_universal), dtype=np.float32)
+    n_mapped = 0
+    for uni_idx, gene in enumerate(universal_gene_names):
+        if gene in pbmc_gene_set:
+            X_universal[:, uni_idx] = X[:, pbmc_gene_set[gene]]
+            n_mapped += 1
+
+    print(f"  Gene coverage: {n_mapped}/{n_universal} universal genes present in PBMC-3K "
+          f"({n_mapped/n_universal*100:.1f}%)")
+
+    if n_cells_subset is not None and n_cells_subset < n_cells:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(n_cells, n_cells_subset, replace=False)
+        X_universal = X_universal[idx]
+        int_labels  = int_labels[idx]
+        adata_raw   = adata_raw[idx].copy()
+
+    print(f"  {X_universal.shape[0]} cells × {n_universal} genes (universal vocab)")
+    print(f"  {len(label_names)} cell types: {label_names}")
+    return X_universal, int_labels, label_names, adata_raw, universal_gene_names
+
+
 # ---------------------------------------------------------------------------
 # PBMC 10k loader (for transfer learning)
 # ---------------------------------------------------------------------------

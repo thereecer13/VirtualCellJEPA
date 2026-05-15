@@ -33,6 +33,7 @@ from cell_jepa import CellJEPA
 from losses import (
     PretrainingLoss, FinetuningLoss, PerturbationLoss, DeltaPerturbationLoss,
     SIGRegPretrainingLoss, SIGRegFinetuningLoss,
+    SIGRegPerturbationLoss, SIGRegDeltaPerturbationLoss,
 )
 
 
@@ -632,6 +633,176 @@ class PerturbationTrainer:
 
 
 # ---------------------------------------------------------------------------
+# SIGReg Perturbation Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SIGRegPerturbationConfig:
+    # Optimizer
+    lr: float = 1e-4
+    lr_decay: float = 0.9
+
+    # Data
+    batch_size: int = 64
+    num_workers: int = 0
+
+    # Training
+    n_epochs: int = 15
+    grad_clip: float = 1.0
+    log_every: int = 20
+
+    # Loss weights
+    w_pert_rec: float = 1.0
+    w_ecs: float = 0.8
+    ecs_temperature: float = 0.1
+
+    # No include_jepa — SIGReg has no EMA teacher
+    predict_delta: bool = False
+
+
+# ---------------------------------------------------------------------------
+# SIGReg Perturbation Trainer
+# ---------------------------------------------------------------------------
+
+class SIGRegPerturbationTrainer:
+    """
+    Fine-tunes CellJEPA_SIGReg for perturbation response prediction.
+
+    Like PerturbationTrainer but uses SIGRegPerturbationLoss /
+    SIGRegDeltaPerturbationLoss and does not call update_teacher().
+
+    The dataset must supply batches with the same keys as PerturbationDataset:
+        gene_ids, values, pert_ids, pert_values, padding, cell_type
+    """
+
+    def __init__(
+        self,
+        model,
+        dataset,
+        config: SIGRegPerturbationConfig = SIGRegPerturbationConfig(),
+        device: Optional[torch.device] = None,
+    ):
+        self.model = model
+        self.dataset = dataset
+        self.config = config
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.model.to(self.device)
+
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer, gamma=config.lr_decay
+        )
+        if config.predict_delta:
+            self.criterion = SIGRegDeltaPerturbationLoss(
+                w_delta=config.w_pert_rec,
+                w_ecs=config.w_ecs,
+                ecs_temperature=config.ecs_temperature,
+            )
+        else:
+            self.criterion = SIGRegPerturbationLoss(
+                w_pert_rec=config.w_pert_rec,
+                w_ecs=config.w_ecs,
+                ecs_temperature=config.ecs_temperature,
+            )
+
+    def train(self) -> list[dict]:
+        loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        history = []
+        for epoch in range(1, self.config.n_epochs + 1):
+            metrics = self._train_epoch(epoch, loader)
+            self.scheduler.step()
+            history.append(metrics)
+            rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
+            print(
+                f"[Epoch {epoch}/{self.config.n_epochs}]  "
+                f"loss={metrics['loss']:.4f}  "
+                f"{rec_key}={metrics[rec_key]:.4f}  "
+                f"l_ecs={metrics['l_ecs']:.4f}  "
+                f"lr={self.scheduler.get_last_lr()[0]:.2e}"
+            )
+        return history
+
+    def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
+        self.model.train()
+        rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
+        total = {k: 0.0 for k in ["loss", rec_key, "l_ecs"]}
+        n_steps = 0
+        t0 = time.time()
+
+        for step, batch in enumerate(loader, 1):
+            batch = batch_to_device(batch, self.device)
+            self.optimizer.zero_grad()
+
+            if self.config.predict_delta:
+                out = self.model.forward_perturb_delta(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    pert_ids=batch["pert_ids"],
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    ctrl_values=batch["values"],
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                    cell_types=batch.get("cell_type"),
+                )
+            else:
+                out = self.model.forward_perturb(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    pert_ids=batch["pert_ids"],
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                    cell_types=batch.get("cell_type"),
+                )
+
+            loss_dict["loss"].backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.optimizer.step()
+
+            for k in total:
+                total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
+            n_steps += 1
+
+            if step % self.config.log_every == 0:
+                elapsed = time.time() - t0
+                print(
+                    f"  Epoch {epoch} | Step {step}/{len(loader)} | "
+                    f"loss={total['loss']/n_steps:.4f} | "
+                    f"{elapsed:.1f}s elapsed"
+                )
+
+        return {k: v / n_steps for k, v in total.items()}
+
+    def save(self, path: str):
+        torch.save(
+            {
+                "model_state": self.model.state_dict(),
+                "optimizer_state": self.optimizer.state_dict(),
+                "config": self.config,
+            },
+            path,
+        )
+        print(f"SIGReg perturbation checkpoint saved to {path}")
+
+
+# ---------------------------------------------------------------------------
 # SIGReg Pre-training Configuration
 # ---------------------------------------------------------------------------
 
@@ -689,6 +860,7 @@ class SIGRegFinetuneConfig:
     ecs_temperature: float = 0.1
     n_directions: int = 256
     n_views: int = 2
+    seed: int = 42
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +962,7 @@ class SIGRegPretrainer:
             n_directions=config.n_directions,
         )
         self._history: list[dict] = []
+        self._start_epoch = 1
 
     def train(self, epoch_callback=None) -> list[dict]:
         use_pin = torch.cuda.is_available() and self.config.num_workers > 0
@@ -804,7 +977,7 @@ class SIGRegPretrainer:
         use_amp = self.device.type == "cuda"
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-        for epoch in range(1, self.config.n_epochs + 1):
+        for epoch in range(self._start_epoch, self.config.n_epochs + 1):
             metrics = self._train_epoch(epoch, loader, scaler, use_amp)
             self.scheduler_decay.step()
             self._history.append(metrics)
@@ -885,7 +1058,7 @@ class SIGRegPretrainer:
 
         return {k: v / n_steps for k, v in total.items()}
 
-    def save(self, path: str):
+    def save(self, path: str, epoch: int = 0):
         torch.save(
             {
                 "model_state": self.model.state_dict(),
@@ -893,10 +1066,23 @@ class SIGRegPretrainer:
                 "config": self.config,
                 "history": self._history,
                 "global_step": self._global_step,
+                "epoch": epoch,
             },
             path,
         )
         print(f"SIGReg checkpoint saved to {path}")
+
+    @classmethod
+    def load_checkpoint(cls, path: str, model, dataset, device=None):
+        ckpt = torch.load(path, map_location=device or "cpu", weights_only=False)
+        trainer = cls(model, dataset, config=ckpt["config"], device=device)
+        trainer.model.load_state_dict(ckpt["model_state"])
+        trainer.optimizer.load_state_dict(ckpt["optimizer_state"])
+        trainer._history = ckpt.get("history", [])
+        trainer._global_step = ckpt.get("global_step", 0)
+        trainer._start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"SIGReg resumed from {path} (next epoch: {trainer._start_epoch})")
+        return trainer
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +1116,7 @@ class SIGRegFinetuner:
         n_train = len(dataset) - n_val
         self.train_dataset, self.val_dataset = random_split(
             dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(42),
+            generator=torch.Generator().manual_seed(config.seed),
         )
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
