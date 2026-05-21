@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_hvg", type=int, default=2000)
     p.add_argument("--test_fraction", type=float, default=0.2)
     p.add_argument("--results_file", default="results_traj_modes.txt")
+    p.add_argument("--modes", default="absolute,delta,traj",
+                   help="Comma-separated subset of modes to run: absolute,delta,traj")
     p.add_argument("--smoke_test", action="store_true",
                    help="3 conditions, 1 epoch, 500 cells")
     p.add_argument(
@@ -367,11 +369,16 @@ def main():
     )
     test_conditions = conditions[test_mask]
 
-    modes = [
+    requested = {m.strip().lower() for m in args.modes.split(",")}
+    all_modes = [
         ("Absolute",    "absolute"),
         ("Delta",       "delta"),
         ("Trajectory",  "traj"),
     ]
+    modes = [(label, mode) for label, mode in all_modes if mode in requested]
+    if not modes:
+        raise ValueError(f"No valid modes in --modes '{args.modes}'. Choose from: absolute, delta, traj")
+    print(f"\nRunning modes: {[label for label, _ in modes]}")
 
     all_results = {}
     for label, mode in modes:
