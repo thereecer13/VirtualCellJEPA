@@ -27,13 +27,16 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from cell_jepa import CellJEPA
 from losses import (
     PretrainingLoss, FinetuningLoss, PerturbationLoss, DeltaPerturbationLoss,
+    TrajPerturbationLoss,
     SIGRegPretrainingLoss, SIGRegFinetuningLoss,
     SIGRegPerturbationLoss, SIGRegDeltaPerturbationLoss,
+    SIGRegTrajPerturbationLoss,
 )
 
 
@@ -202,6 +205,7 @@ class Pretrainer:
                 f"loss={metrics['loss']:.4f}  "
                 f"l_jepa={metrics['l_jepa']:.4f}  "
                 f"l_rec={metrics['l_rec']:.4f}  "
+                f"cos_sim={metrics['cos_sim']:.4f}  "
                 f"lr={self.scheduler.get_last_lr()[0]:.2e}"
             )
             if epoch_callback is not None:
@@ -211,7 +215,7 @@ class Pretrainer:
     def _train_epoch(self, epoch: int, loader: DataLoader,
                      scaler=None, use_amp: bool = False) -> dict:
         self.model.train()
-        total_loss = total_jepa = total_rec = 0.0
+        total_loss = total_jepa = total_rec = total_cos_sim = 0.0
         n_steps = 0
         t0 = time.time()
 
@@ -246,10 +250,17 @@ class Pretrainer:
             # EMA teacher update (after each gradient step)
             self.model.update_teacher()
 
-            total_loss += loss_dict["loss"].item()
-            total_jepa += loss_dict["l_jepa"].item()
-            total_rec  += loss_dict["l_rec"].item()
-            n_steps    += 1
+            # Collapse diagnostic: cosine similarity between student and teacher CLS
+            # before the predictor. If this → 1.0 early, the representations have collapsed.
+            cos_sim = F.cosine_similarity(
+                out["e_hat"].detach(), out["e"].detach(), dim=-1
+            ).mean().item()
+
+            total_loss    += loss_dict["loss"].item()
+            total_jepa    += loss_dict["l_jepa"].item()
+            total_rec     += loss_dict["l_rec"].item()
+            total_cos_sim += cos_sim
+            n_steps       += 1
 
             if step % self.config.log_every == 0:
                 elapsed = time.time() - t0
@@ -258,13 +269,15 @@ class Pretrainer:
                     f"loss={total_loss/n_steps:.4f} | "
                     f"l_jepa={total_jepa/n_steps:.4f} | "
                     f"l_rec={total_rec/n_steps:.4f} | "
+                    f"cos_sim(student,teacher)={total_cos_sim/n_steps:.4f} | "
                     f"{elapsed:.1f}s elapsed"
                 )
 
         return {
-            "loss":   total_loss / n_steps,
-            "l_jepa": total_jepa / n_steps,
-            "l_rec":  total_rec  / n_steps,
+            "loss":    total_loss    / n_steps,
+            "l_jepa":  total_jepa   / n_steps,
+            "l_rec":   total_rec    / n_steps,
+            "cos_sim": total_cos_sim / n_steps,
         }
 
     def save(self, path: str):
@@ -352,10 +365,13 @@ class Finetuner:
             pin_memory=torch.cuda.is_available(),
         )
 
+        use_amp = self.device.type == "cuda"
+        scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
+
         history = []
         for epoch in range(1, self.config.n_epochs + 1):
-            train_metrics = self._train_epoch(epoch, train_loader)
-            val_metrics   = self._val_epoch(val_loader)
+            train_metrics = self._train_epoch(epoch, train_loader, scaler, use_amp)
+            val_metrics   = self._val_epoch(val_loader, use_amp)
             self.scheduler.step()
 
             metrics = {**{f"train_{k}": v for k, v in train_metrics.items()},
@@ -370,7 +386,8 @@ class Finetuner:
             )
         return history
 
-    def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
+    def _train_epoch(self, epoch: int, loader: DataLoader,
+                     scaler=None, use_amp: bool = False) -> dict:
         self.model.train()
         total = {k: 0.0 for k in ["loss", "l_gep", "l_gepc", "l_ecs", "l_jepa"]}
         n = 0
@@ -379,24 +396,26 @@ class Finetuner:
             batch = batch_to_device(batch, self.device)
             self.optimizer.zero_grad()
 
-            out = self.model(
-                gene_ids=batch["gene_ids"],
-                values=batch["values"],
-                masked_vals=batch["masked_vals"],
-                is_masked=batch["mask"],
-                is_pad=batch["padding"],
-            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = self.model(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    masked_vals=batch["masked_vals"],
+                    is_masked=batch["mask"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=batch["values"],
+                    is_masked=batch["mask"],
+                    cell_types=batch["cell_type"],
+                )
 
-            loss_dict = self.criterion(
-                model_out=out,
-                target_values=batch["values"],
-                is_masked=batch["mask"],
-                cell_types=batch["cell_type"],
-            )
-
-            loss_dict["loss"].backward()
+            scaler.scale(loss_dict["loss"]).backward()
+            scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            self.optimizer.step()
+            scaler.step(self.optimizer)
+            scaler.update()
             self.model.update_teacher()
 
             for k in total:
@@ -406,26 +425,27 @@ class Finetuner:
         return {k: v / n for k, v in total.items()}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> dict:
+    def _val_epoch(self, loader: DataLoader, use_amp: bool = False) -> dict:
         self.model.eval()
         total = {k: 0.0 for k in ["loss", "l_gep", "l_gepc", "l_ecs", "l_jepa"]}
         n = 0
 
         for batch in loader:
             batch = batch_to_device(batch, self.device)
-            out = self.model(
-                gene_ids=batch["gene_ids"],
-                values=batch["values"],
-                masked_vals=batch["masked_vals"],
-                is_masked=batch["mask"],
-                is_pad=batch["padding"],
-            )
-            loss_dict = self.criterion(
-                model_out=out,
-                target_values=batch["values"],
-                is_masked=batch["mask"],
-                cell_types=batch["cell_type"],
-            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = self.model(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    masked_vals=batch["masked_vals"],
+                    is_masked=batch["mask"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=batch["values"],
+                    is_masked=batch["mask"],
+                    cell_types=batch["cell_type"],
+                )
             for k in total:
                 total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
             n += 1
@@ -472,6 +492,8 @@ class PerturbationConfig:
     # Ablation flags
     include_jepa: bool = True   # False → zero out JEPA term
     predict_delta: bool = False # True → use DeltaPerturbationLoss instead of absolute rec
+    predict_traj: bool = False  # True → use TrajPerturbationLoss + forward_perturb_traj()
+    w_delta: float = 1.0        # weight for l_delta in TrajPerturbationLoss
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +540,14 @@ class PerturbationTrainer:
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizer, gamma=config.lr_decay
         )
-        if config.predict_delta:
+        if config.predict_traj:
+            self.criterion = TrajPerturbationLoss(
+                w_delta=config.w_delta,
+                w_pert_rec=config.w_pert_rec,
+                w_ecs=config.w_ecs,
+                ecs_temperature=config.ecs_temperature,
+            )
+        elif config.predict_delta:
             self.criterion = DeltaPerturbationLoss(
                 w_delta=config.w_pert_rec,
                 w_jepa_pert=config.w_jepa_pert,
@@ -549,12 +578,20 @@ class PerturbationTrainer:
             metrics = self._train_epoch(epoch, loader)
             self.scheduler.step()
             history.append(metrics)
-            rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
+            if self.config.predict_traj:
+                rec_key  = "l_pert_rec"
+                aux_key  = "l_delta"
+            elif self.config.predict_delta:
+                rec_key  = "l_delta"
+                aux_key  = "l_jepa_pert"
+            else:
+                rec_key  = "l_pert_rec"
+                aux_key  = "l_jepa_pert"
             print(
                 f"[Epoch {epoch}/{self.config.n_epochs}]  "
                 f"loss={metrics['loss']:.4f}  "
                 f"{rec_key}={metrics[rec_key]:.4f}  "
-                f"l_jepa_pert={metrics['l_jepa_pert']:.4f}  "
+                f"{aux_key}={metrics[aux_key]:.4f}  "
                 f"l_ecs={metrics['l_ecs']:.4f}  "
                 f"lr={self.scheduler.get_last_lr()[0]:.2e}"
             )
@@ -562,8 +599,12 @@ class PerturbationTrainer:
 
     def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
         self.model.train()
-        rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
-        total = {k: 0.0 for k in ["loss", rec_key, "l_jepa_pert", "l_ecs"]}
+        if self.config.predict_traj:
+            total = {k: 0.0 for k in ["loss", "l_delta", "l_pert_rec", "l_ecs"]}
+        elif self.config.predict_delta:
+            total = {k: 0.0 for k in ["loss", "l_delta", "l_jepa_pert", "l_ecs"]}
+        else:
+            total = {k: 0.0 for k in ["loss", "l_pert_rec", "l_jepa_pert", "l_ecs"]}
         n_steps = 0
         t0 = time.time()
 
@@ -571,7 +612,21 @@ class PerturbationTrainer:
             batch = batch_to_device(batch, self.device)
             self.optimizer.zero_grad()
 
-            if self.config.predict_delta:
+            if self.config.predict_traj:
+                out = self.model.forward_perturb_traj(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    pert_ids=batch["pert_ids"],
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                    cell_types=batch.get("cell_type"),
+                )
+            elif self.config.predict_delta:
                 out = self.model.forward_perturb_delta(
                     gene_ids=batch["gene_ids"],
                     values=batch["values"],
@@ -658,6 +713,8 @@ class SIGRegPerturbationConfig:
 
     # No include_jepa — SIGReg has no EMA teacher
     predict_delta: bool = False
+    predict_traj: bool = False  # True → use SIGRegTrajPerturbationLoss + forward_perturb_traj()
+    w_delta: float = 1.0        # weight for l_delta in SIGRegTrajPerturbationLoss
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +751,14 @@ class SIGRegPerturbationTrainer:
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizer, gamma=config.lr_decay
         )
-        if config.predict_delta:
+        if config.predict_traj:
+            self.criterion = SIGRegTrajPerturbationLoss(
+                w_delta=config.w_delta,
+                w_pert_rec=config.w_pert_rec,
+                w_ecs=config.w_ecs,
+                ecs_temperature=config.ecs_temperature,
+            )
+        elif config.predict_delta:
             self.criterion = SIGRegDeltaPerturbationLoss(
                 w_delta=config.w_pert_rec,
                 w_ecs=config.w_ecs,
@@ -721,7 +785,7 @@ class SIGRegPerturbationTrainer:
             metrics = self._train_epoch(epoch, loader)
             self.scheduler.step()
             history.append(metrics)
-            rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
+            rec_key = "l_delta" if (self.config.predict_delta or self.config.predict_traj) else "l_pert_rec"
             print(
                 f"[Epoch {epoch}/{self.config.n_epochs}]  "
                 f"loss={metrics['loss']:.4f}  "
@@ -733,8 +797,12 @@ class SIGRegPerturbationTrainer:
 
     def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
         self.model.train()
-        rec_key = "l_delta" if self.config.predict_delta else "l_pert_rec"
-        total = {k: 0.0 for k in ["loss", rec_key, "l_ecs"]}
+        if self.config.predict_traj:
+            total = {k: 0.0 for k in ["loss", "l_delta", "l_pert_rec", "l_ecs"]}
+        elif self.config.predict_delta:
+            total = {k: 0.0 for k in ["loss", "l_delta", "l_ecs"]}
+        else:
+            total = {k: 0.0 for k in ["loss", "l_pert_rec", "l_ecs"]}
         n_steps = 0
         t0 = time.time()
 
@@ -742,7 +810,21 @@ class SIGRegPerturbationTrainer:
             batch = batch_to_device(batch, self.device)
             self.optimizer.zero_grad()
 
-            if self.config.predict_delta:
+            if self.config.predict_traj:
+                out = self.model.forward_perturb_traj(
+                    gene_ids=batch["gene_ids"],
+                    values=batch["values"],
+                    pert_ids=batch["pert_ids"],
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                )
+                loss_dict = self.criterion(
+                    model_out=out,
+                    pert_values=batch["pert_values"],
+                    is_pad=batch["padding"],
+                    cell_types=batch.get("cell_type"),
+                )
+            elif self.config.predict_delta:
                 out = self.model.forward_perturb_delta(
                     gene_ids=batch["gene_ids"],
                     values=batch["values"],
@@ -1134,19 +1216,25 @@ class SIGRegFinetuner:
         )
 
     def train(self) -> list[dict]:
+        use_pin = torch.cuda.is_available() and self.config.num_workers > 0
         train_loader = DataLoader(
             self.train_dataset, batch_size=self.config.batch_size,
             shuffle=True, num_workers=self.config.num_workers,
+            pin_memory=use_pin,
         )
         val_loader = DataLoader(
             self.val_dataset, batch_size=self.config.batch_size,
             shuffle=False, num_workers=self.config.num_workers,
+            pin_memory=use_pin,
         )
+
+        use_amp = self.device.type == "cuda"
+        scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         history = []
         for epoch in range(1, self.config.n_epochs + 1):
-            train_m = self._train_epoch(epoch, train_loader)
-            val_m   = self._val_epoch(val_loader)
+            train_m = self._train_epoch(epoch, train_loader, scaler, use_amp)
+            val_m   = self._val_epoch(val_loader, use_amp)
             self.scheduler.step()
             metrics = {**{f"train_{k}": v for k, v in train_m.items()},
                        **{f"val_{k}":   v for k, v in val_m.items()}}
@@ -1177,7 +1265,8 @@ class SIGRegFinetuner:
         return out, {"values": values, "is_masked": is_masked_list[0],
                      "cell_type": batch.get("cell_type")}
 
-    def _train_epoch(self, epoch: int, loader: DataLoader) -> dict:
+    def _train_epoch(self, epoch: int, loader: DataLoader,
+                     scaler=None, use_amp: bool = False) -> dict:
         self.model.train()
         keys = ["loss", "l_gep", "l_gepc", "l_ecs", "l_sim", "l_sigreg"]
         total = {k: 0.0 for k in keys}
@@ -1185,36 +1274,40 @@ class SIGRegFinetuner:
         for batch in loader:
             batch = batch_to_device(batch, self.device)
             self.optimizer.zero_grad()
-            out, aux = self._forward_batch(batch)
-            loss_dict = self.criterion(
-                model_out=out,
-                target_values=aux["values"],
-                is_masked=aux["is_masked"],
-                cell_types=aux["cell_type"],
-            )
-            loss_dict["loss"].backward()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out, aux = self._forward_batch(batch)
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=aux["values"],
+                    is_masked=aux["is_masked"],
+                    cell_types=aux["cell_type"],
+                )
+            scaler.scale(loss_dict["loss"]).backward()
+            scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            self.optimizer.step()
+            scaler.step(self.optimizer)
+            scaler.update()
             for k in total:
                 total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
             n += 1
         return {k: v / n for k, v in total.items()}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> dict:
+    def _val_epoch(self, loader: DataLoader, use_amp: bool = False) -> dict:
         self.model.eval()
         keys = ["loss", "l_gep", "l_gepc", "l_ecs", "l_sim", "l_sigreg"]
         total = {k: 0.0 for k in keys}
         n = 0
         for batch in loader:
             batch = batch_to_device(batch, self.device)
-            out, aux = self._forward_batch(batch)
-            loss_dict = self.criterion(
-                model_out=out,
-                target_values=aux["values"],
-                is_masked=aux["is_masked"],
-                cell_types=aux["cell_type"],
-            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out, aux = self._forward_batch(batch)
+                loss_dict = self.criterion(
+                    model_out=out,
+                    target_values=aux["values"],
+                    is_masked=aux["is_masked"],
+                    cell_types=aux["cell_type"],
+                )
             for k in total:
                 total[k] += loss_dict[k].item() if k != "loss" else loss_dict["loss"].item()
             n += 1

@@ -112,6 +112,12 @@ class CellJEPA_SIGReg(nn.Module):
                 nn.ReLU(),
                 nn.Linear(d_model, n_bins + 1),
             )
+            # Trajectory predictor p_traj: (e_ctrl ‖ p_global) → Δe_pred
+            self.p_traj = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
             if predict_delta:
                 self.delta_head = nn.Sequential(
                     nn.Linear(d_model, d_model // 2),
@@ -268,6 +274,75 @@ class CellJEPA_SIGReg(nn.Module):
         out = self.forward_perturb(gene_ids, values, pert_ids, pert_values, is_pad)
         delta_hat = self.delta_head(out["H_hat_pert"]).squeeze(-1)  # (B, L)
         return {**out, "delta_hat": delta_hat}
+
+    def forward_perturb_traj(
+        self,
+        gene_ids: torch.LongTensor,
+        values: torch.LongTensor,
+        pert_ids: torch.LongTensor,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+    ) -> dict:
+        """
+        Decoupled perturbation forward pass for SIGReg (no EMA teacher).
+
+        The encoder is kept blind to the perturbation identity and produces a
+        clean control embedding e_ctrl.  The trajectory predictor p_traj maps
+        (e_ctrl ‖ p_global) → Δe_pred, and e_pert_pred = e_ctrl + Δe_pred.
+
+        Since SIGReg has no EMA teacher, stop-gradient targets are computed by
+        running the same encoder under torch.no_grad():
+            e_ctrl_sg  = e_ctrl.detach()
+            e_pert_sg  = encoder(no_grad, pert_values)[:, 0, :]
+            delta_target = e_pert_sg − e_ctrl_sg
+
+        Returns dict with keys:
+            e_ctrl       : (B, D) control CLS embedding
+            delta_pred   : (B, D) predicted latent trajectory Δe_pred
+            delta_target : (B, D) stop-gradient true trajectory
+            e_pert_pred  : (B, D) predicted perturbed embedding
+            v_hat_pert   : (B, L, n_bins+1) reconstruction logits
+        """
+        if self.n_perturbations == 0:
+            raise RuntimeError(
+                "forward_perturb_traj requires n_perturbations > 0 at model init."
+            )
+
+        # Step 1: Encoder sees ONLY the control state (no perturbation embedding)
+        Z_ctrl = self.embed(gene_ids, values)                          # (B, L, D)
+        H_ctrl = self._encode(Z_ctrl, attn_mask=None,
+                              key_padding_mask=is_pad)                 # (B, L, D)
+        e_ctrl = H_ctrl[:, 0, :]                                       # (B, D)
+
+        # Step 2: Global perturbation embedding — one vector per cell
+        p_global = self.perturb_embedding(pert_ids[:, 0])              # (B, D)
+
+        # Step 3: Trajectory predictor
+        traj_input  = torch.cat([e_ctrl, p_global], dim=-1)            # (B, 2D)
+        delta_pred  = self.p_traj(traj_input)                          # (B, D)
+        e_pert_pred = e_ctrl + delta_pred                              # (B, D)
+
+        # Step 4: Stop-gradient targets (no EMA teacher — same encoder, no_grad)
+        e_ctrl_sg = e_ctrl.detach()                                    # (B, D)
+        with torch.no_grad():
+            Z_pert_sg = self.embed(gene_ids, pert_values)              # (B, L, D)
+            H_pert_sg = self._encode(Z_pert_sg, attn_mask=None,
+                                     key_padding_mask=is_pad)
+            e_pert_sg = H_pert_sg[:, 0, :]                             # (B, D)
+        delta_target = e_pert_sg - e_ctrl_sg                           # (B, D)
+
+        # Step 5: Reconstruct gene expression — per-token hidden states shifted by
+        # the global perturbation prediction (H_ctrl gives local gene context;
+        # e_pert_pred.unsqueeze(1) broadcasts the latent delta across all positions).
+        v_hat_pert = self.perturb_value_head(H_ctrl + e_pert_pred.unsqueeze(1))  # (B, L, n_bins+1)
+
+        return {
+            "e_ctrl":       e_ctrl,
+            "delta_pred":   delta_pred,
+            "delta_target": delta_target,
+            "e_pert_pred":  e_pert_pred,
+            "v_hat_pert":   v_hat_pert,
+        }
 
     @torch.no_grad()
     def encode(

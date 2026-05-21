@@ -342,6 +342,14 @@ class CellJEPA(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(d_model, n_bins + 1),
             )
+            # Trajectory predictor p_traj: (e_ctrl ‖ p_global) → Δe_pred
+            # Input is 2×d_model (concat of cell embedding and perturbation embedding).
+            self.p_traj = nn.Sequential(
+                nn.Linear(2 * d_model, predictor_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(predictor_hidden, d_model),
+            )
             if predict_delta:
                 # Delta head: predicts (pert_bins - ctrl_bins) as a scalar per gene
                 self.delta_head = nn.Sequential(
@@ -613,3 +621,87 @@ class CellJEPA(nn.Module):
         delta_hat = self.delta_head(out["H_hat_pert"]).squeeze(-1)  # (B, L)
 
         return {**out, "delta_hat": delta_hat}
+
+    # ------------------------------------------------------------------
+    # Trajectory Predictor Forward Pass  (decoupled cell-level strategy)
+    # ------------------------------------------------------------------
+
+    def forward_perturb_traj(
+        self,
+        gene_ids: torch.LongTensor,
+        values: torch.LongTensor,
+        pert_ids: torch.LongTensor,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+    ) -> dict:
+        """
+        Decoupled perturbation forward pass (trajectory predictor strategy).
+
+        The Student Encoder is kept blind to the perturbation identity —
+        it receives only the baseline control expression and produces a
+        clean cell embedding e_ctrl.  A separate trajectory predictor head
+        p_traj then maps (e_ctrl ‖ p_global) to a latent delta Δe_pred,
+        and the predicted perturbed embedding is e_pert_pred = e_ctrl + Δe_pred.
+
+        Token construction:
+            student input : y_i + v_i  (control values, NO perturbation embedding)
+            teacher ctrl  : y_i + v_i  (same as student, for e_ctrl_target)
+            teacher pert  : y_i + v_i^pert (ground-truth perturbed, for e_pert_target)
+
+        Args:
+            gene_ids:    (B, L) gene vocabulary IDs (incl. <cls> at pos 0)
+            values:      (B, L) baseline (control) bin indices
+            pert_ids:    (B, L) perturbation vocab IDs — same value broadcast per cell
+            pert_values: (B, L) ground-truth post-perturbation bin indices
+            is_pad:      (B, L) True at padding positions
+
+        Returns dict with keys:
+            e_ctrl       : (B, D) student control <cls> embedding
+            delta_pred   : (B, D) predicted latent trajectory Δe_pred from p_traj
+            delta_target : (B, D) true latent trajectory Δe_target (stop-grad)
+            e_pert_pred  : (B, D) predicted perturbed embedding = e_ctrl + delta_pred
+            v_hat_pert   : (B, L, n_bins+1) reconstruction logits from e_pert_pred
+        """
+        if self.n_perturbations == 0:
+            raise RuntimeError(
+                "forward_perturb_traj requires n_perturbations > 0 at model init."
+            )
+
+        # Step 1: Student sees ONLY the control state (no perturbation embedding)
+        Z_ctrl = self.embed(gene_ids, values)                      # (B, L, D)
+        H_ctrl = self.student(Z_ctrl, key_padding_mask=is_pad)     # (B, L, D)
+        e_ctrl = H_ctrl[:, 0, :]                                   # (B, D)
+
+        # Step 2: Global perturbation embedding — one vector per cell.
+        # pert_ids[:, 0] is safe because PerturbationDataset broadcasts the same
+        # pert_id to every token position in the sequence.
+        p_global = self.perturb_embedding(pert_ids[:, 0])          # (B, D)
+
+        # Step 3: Trajectory predictor
+        traj_input = torch.cat([e_ctrl, p_global], dim=-1)         # (B, 2D)
+        delta_pred = self.p_traj(traj_input)                       # (B, D)
+        e_pert_pred = e_ctrl + delta_pred                          # (B, D)
+
+        # Step 4: Teacher targets — both ctrl and pert, no perturbation embedding
+        with torch.no_grad():
+            H_ctrl_t     = self.teacher(Z_ctrl, key_padding_mask=is_pad)
+            e_ctrl_target = H_ctrl_t[:, 0, :]                     # (B, D)
+
+            Z_pert_t      = self.embed(gene_ids, pert_values)      # (B, L, D)
+            H_pert_t      = self.teacher(Z_pert_t, key_padding_mask=is_pad)
+            e_pert_target = H_pert_t[:, 0, :]                     # (B, D)
+
+            delta_target  = e_pert_target - e_ctrl_target          # (B, D)
+
+        # Step 5: Reconstruct gene expression — per-token hidden states shifted by
+        # the global perturbation prediction (H_ctrl gives local gene context;
+        # e_pert_pred.unsqueeze(1) broadcasts the latent delta across all positions).
+        v_hat_pert = self.perturb_value_head(H_ctrl + e_pert_pred.unsqueeze(1))  # (B, L, n_bins+1)
+
+        return {
+            "e_ctrl":        e_ctrl,
+            "delta_pred":    delta_pred,
+            "delta_target":  delta_target,
+            "e_pert_pred":   e_pert_pred,
+            "v_hat_pert":    v_hat_pert,
+        }

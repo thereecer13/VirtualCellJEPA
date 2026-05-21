@@ -104,6 +104,13 @@ def parse_args() -> argparse.Namespace:
                    help="Resume Cell-JEPA from this checkpoint (.pt)")
     p.add_argument("--resume_sigreg", default=None,
                    help="Resume SIGReg from this checkpoint (.pt)")
+    p.add_argument("--skip_epoch_saves", action="store_true",
+                   help="Skip per-epoch checkpoint saves (saves Drive space); "
+                        "only the final checkpoint is written")
+    p.add_argument("--data_cache_dir", default=None,
+                   help="Directory to cache downloaded tissue arrays as .npy files. "
+                        "Use a Drive path (e.g. /content/drive/MyDrive/CellJEPA_results/data_cache/) "
+                        "to avoid re-downloading on subsequent runs.")
     return p.parse_args()
 
 
@@ -219,12 +226,29 @@ def _load_tissue_cells(
     n_cells: int,
     universal_gene_names: list[str],
     seed: int,
+    data_cache_dir: str | None = None,
 ) -> np.ndarray:
     """
     Download `n_cells` cells from a single tissue via CELLxGENE Census,
     apply QC, and project into the universal vocab space.
     Returns (n_cells_after_qc, n_universal) float32 array.
+
+    If data_cache_dir is set, the processed array is saved/loaded as a .npy
+    file named {tissue}_{n_cells}cells_universal.npy to avoid re-downloading.
     """
+    if data_cache_dir is not None:
+        os.makedirs(data_cache_dir, exist_ok=True)
+        cache_path = os.path.join(
+            data_cache_dir, f"{tissue}_{n_cells}cells_universal.npy"
+        )
+        if os.path.exists(cache_path):
+            print(f"  [{tissue}] loading from cache: {cache_path}")
+            X_uni = np.load(cache_path)
+            print(f"  [{tissue}] {X_uni.shape[0]:,} cells (cached)")
+            return X_uni
+    else:
+        cache_path = None
+
     import cellxgene_census
 
     print(f"  [{tissue}] querying Census …")
@@ -274,6 +298,12 @@ def _load_tissue_cells(
     print(f"  [{tissue}] {X_uni.shape[0]:,} cells retained  "
           f"({n_mapped}/{len(universal_gene_names)} genes mapped, "
           f"{n_mapped/len(universal_gene_names)*100:.1f}%)")
+
+    if cache_path is not None:
+        np.save(cache_path, X_uni)
+        size_mb = os.path.getsize(cache_path) / 1e6
+        print(f"  [{tissue}] cached to {cache_path} ({size_mb:.0f} MB)")
+
     return X_uni
 
 
@@ -281,6 +311,7 @@ def load_multitissue_universal(
     universal_gene_names: list[str],
     n_cells_per_tissue: int = 8333,
     smoke_test: bool = False,
+    data_cache_dir: str | None = None,
 ) -> np.ndarray:
     """
     Download cells uniformly from MULTITISSUE_TISSUES (excluding blood/PBMC),
@@ -294,6 +325,7 @@ def load_multitissue_universal(
         universal_gene_names: ordered list from universal_gene_names.json
         n_cells_per_tissue:   cells to sample per tissue (after QC some will drop)
         smoke_test:           use 50 cells per tissue for a quick sanity check
+        data_cache_dir:       if set, cache each tissue array as a .npy file here
     """
     try:
         import cellxgene_census  # noqa: F401
@@ -307,12 +339,15 @@ def load_multitissue_universal(
           f"target {n_cells_per_tissue:,} cells each")
     print(f"Tissues: {', '.join(MULTITISSUE_TISSUES)}")
     print("(blood/PBMC excluded — PBMC-3K is the held-out transfer target)\n")
+    if data_cache_dir:
+        print(f"Data cache: {data_cache_dir}\n")
 
     chunks = []
     for i, tissue in enumerate(MULTITISSUE_TISSUES):
         # Use different seeds per tissue so sampling is independent
         X_tissue = _load_tissue_cells(
-            tissue, n_cells_per_tissue, universal_gene_names, seed=42 + i
+            tissue, n_cells_per_tissue, universal_gene_names,
+            seed=42 + i, data_cache_dir=data_cache_dir,
         )
         if X_tissue.shape[0] > 0:
             chunks.append(X_tissue)
@@ -439,6 +474,7 @@ def main():
             universal_gene_names,
             n_cells_per_tissue=n_per_tissue,
             smoke_test=args.smoke_test,
+            data_cache_dir=args.data_cache_dir,
         )
         prefix = "multitissue_universal"
     else:
@@ -536,6 +572,8 @@ def main():
             sigreg_trainer = SIGRegPretrainer(sigreg_model, dataset, sigreg_config, device)
 
         def save_sigreg_epoch(epoch: int):
+            if args.skip_epoch_saves:
+                return
             path = os.path.join(args.drive_dir, f"{prefix}_sigreg_epoch{epoch}.pt")
             sigreg_trainer.save(path, epoch=epoch)
 

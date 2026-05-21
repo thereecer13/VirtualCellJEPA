@@ -145,21 +145,23 @@ def load_pbmc3k_universal(
     universal_gene_names: list[str],
     n_cells_subset: int | None = None,
     seed: int = 42,
+    n_hvg: int = 2000,
 ):
     """
     Load PBMC3k aligned to a pre-built universal gene vocabulary.
 
-    Instead of selecting HVGs, this returns the full expression matrix
-    re-indexed to match universal_gene_names order (zeros for missing genes).
-    Genes not present in PBMC-3K are set to zero for all cells.
+    Selects the top n_hvg highly variable genes from PBMC-3K (matching the
+    Cell-JEPA paper) and projects only those into the universal vocab space.
+    Non-HVG columns are left as zero so SingleCellDataset never samples them.
+    Universal token IDs are preserved — no alignment problem.
 
-    This is the evaluation counterpart to pretrain_universal.py — both use
-    the same token IDs so no gene alignment is needed at fine-tuning time.
+    Set n_hvg=0 to disable HVG selection and use all expressed genes.
 
     Args:
         universal_gene_names: Ordered list of gene symbols in the universal vocab.
         n_cells_subset: Optional subsample for smoke test.
         seed: RNG seed for subsample.
+        n_hvg: Number of highly variable genes to select (default 2000, paper value).
 
     Returns:
         count_matrix : (N, len(universal_gene_names)) float32
@@ -186,7 +188,15 @@ def load_pbmc3k_universal(
     sc.pp.normalize_total(adata_raw, target_sum=1e4)
     sc.pp.log1p(adata_raw)
 
-    # Project PBMC-3K genes into universal vocab space
+    # HVG selection — compute on all cells before any subsetting
+    if n_hvg and n_hvg > 0:
+        sc.pp.highly_variable_genes(adata_raw, n_top_genes=n_hvg, flavor="seurat")
+        hvg_set = set(adata_raw.var_names[adata_raw.var["highly_variable"]])
+        print(f"  Selected {len(hvg_set)} HVGs from PBMC-3K")
+    else:
+        hvg_set = None
+
+    # Project PBMC-3K genes into universal vocab space (HVGs only if selected)
     pbmc_gene_set = {g: i for i, g in enumerate(adata_raw.var_names)}
     n_universal = len(universal_gene_names)
     n_cells = adata_raw.n_obs
@@ -199,11 +209,12 @@ def load_pbmc3k_universal(
     X_universal = np.zeros((n_cells, n_universal), dtype=np.float32)
     n_mapped = 0
     for uni_idx, gene in enumerate(universal_gene_names):
-        if gene in pbmc_gene_set:
+        if gene in pbmc_gene_set and (hvg_set is None or gene in hvg_set):
             X_universal[:, uni_idx] = X[:, pbmc_gene_set[gene]]
             n_mapped += 1
 
-    print(f"  Gene coverage: {n_mapped}/{n_universal} universal genes present in PBMC-3K "
+    hvg_note = f" ({n_hvg} HVGs)" if hvg_set is not None else ""
+    print(f"  Gene coverage: {n_mapped}/{n_universal} universal genes mapped from PBMC-3K{hvg_note} "
           f"({n_mapped/n_universal*100:.1f}%)")
 
     if n_cells_subset is not None and n_cells_subset < n_cells:

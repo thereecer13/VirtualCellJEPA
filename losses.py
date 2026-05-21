@@ -524,6 +524,87 @@ class DeltaPerturbationLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Trajectory Perturbation Loss  (decoupled cell-level strategy)
+# ---------------------------------------------------------------------------
+
+class TrajPerturbationLoss(nn.Module):
+    """
+    Loss for the trajectory predictor strategy (forward_perturb_traj).
+
+    Three supervised signals:
+        l_delta    : cosine distance between predicted and target latent delta
+                     = 1 − cos_sim(Δe_pred, Δe_target)   (direction supervision)
+        l_pert_rec : MSE reconstruction of post-perturbation expression
+                     computed from e_pert_pred broadcast to all gene positions
+        l_ecs      : ECS contrastive loss on e_pert_pred (optional)
+
+    Total: w_delta * l_delta + w_pert_rec * l_pert_rec + w_ecs * l_ecs
+    """
+
+    def __init__(
+        self,
+        w_delta: float = 1.0,
+        w_pert_rec: float = 1.0,
+        w_ecs: float = 0.8,
+        ecs_temperature: float = 0.1,
+    ):
+        super().__init__()
+        self.w_delta = w_delta
+        self.w_pert_rec = w_pert_rec
+        self.w_ecs = w_ecs
+        self.ecs_temperature = ecs_temperature
+
+    def forward(
+        self,
+        model_out: dict,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+        cell_types: Optional[torch.LongTensor] = None,
+    ) -> dict:
+        """
+        Args:
+            model_out:   Output dict from CellJEPA.forward_perturb_traj().
+                         Must contain 'delta_pred', 'delta_target', 'e_pert_pred',
+                         'v_hat_pert'.
+            pert_values: (B, L) ground-truth perturbed bin indices
+            is_pad:      (B, L) padding mask
+            cell_types:  (B,)  integer cell-type labels for ECS (optional)
+
+        Returns:
+            Dict with 'loss', 'l_delta', 'l_pert_rec', 'l_ecs'.
+        """
+        # Cosine distance between predicted and target latent trajectory
+        l_delta = (
+            1.0 - F.cosine_similarity(
+                model_out["delta_pred"], model_out["delta_target"], dim=-1
+            )
+        ).mean()
+
+        l_pert_rec = perturbation_rec_loss(
+            model_out["v_hat_pert"], pert_values, is_pad
+        )
+
+        l_ecs = (
+            ecs_loss(model_out["e_pert_pred"], cell_types, self.ecs_temperature)
+            if cell_types is not None
+            else model_out["e_pert_pred"].new_tensor(0.0)
+        )
+
+        total = (
+            self.w_delta    * l_delta
+            + self.w_pert_rec * l_pert_rec
+            + self.w_ecs      * l_ecs
+        )
+
+        return {
+            "loss":       total,
+            "l_delta":    l_delta.detach(),
+            "l_pert_rec": l_pert_rec.detach(),
+            "l_ecs":      l_ecs.detach(),
+        }
+
+
+# ---------------------------------------------------------------------------
 # SIGReg Perturbation Losses  (no teacher — no l_jepa_pert term)
 # ---------------------------------------------------------------------------
 
@@ -607,6 +688,83 @@ class SIGRegDeltaPerturbationLoss(nn.Module):
             "loss":    total,
             "l_delta": l_delta.detach(),
             "l_ecs":   l_ecs.detach(),
+        }
+
+
+class SIGRegTrajPerturbationLoss(nn.Module):
+    """
+    Trajectory predictor loss for CellJEPA_SIGReg (no EMA teacher).
+
+    Uses stop-gradient targets produced by the same encoder run under no_grad:
+        delta_target = e_pert_sg − e_ctrl_sg   (both stop-gradient)
+
+    Three supervised signals:
+        l_delta    = 1 − cos_sim(delta_pred, delta_target)
+        l_pert_rec = MSE reconstruction of post-perturbation expression from e_pert_pred
+        l_ecs      = ECS contrastive loss on e_pert_pred (optional)
+
+    Total: w_delta * l_delta + w_pert_rec * l_pert_rec + w_ecs * l_ecs
+    """
+
+    def __init__(
+        self,
+        w_delta: float = 1.0,
+        w_pert_rec: float = 1.0,
+        w_ecs: float = 0.8,
+        ecs_temperature: float = 0.1,
+    ):
+        super().__init__()
+        self.w_delta = w_delta
+        self.w_pert_rec = w_pert_rec
+        self.w_ecs = w_ecs
+        self.ecs_temperature = ecs_temperature
+
+    def forward(
+        self,
+        model_out: dict,
+        pert_values: torch.LongTensor,
+        is_pad: torch.BoolTensor,
+        cell_types: Optional[torch.LongTensor] = None,
+    ) -> dict:
+        """
+        Args:
+            model_out:   Output dict from CellJEPA_SIGReg.forward_perturb_traj().
+                         Must contain 'delta_pred', 'delta_target', 'e_pert_pred',
+                         'v_hat_pert'.
+            pert_values: (B, L) ground-truth perturbed bin indices
+            is_pad:      (B, L) padding mask
+            cell_types:  (B,)  integer cell-type labels for ECS (optional)
+
+        Returns:
+            Dict with 'loss', 'l_delta', 'l_pert_rec', 'l_ecs'.
+        """
+        l_delta = (
+            1.0 - F.cosine_similarity(
+                model_out["delta_pred"], model_out["delta_target"], dim=-1
+            )
+        ).mean()
+
+        l_pert_rec = perturbation_rec_loss(
+            model_out["v_hat_pert"], pert_values, is_pad
+        )
+
+        l_ecs = (
+            ecs_loss(model_out["e_pert_pred"], cell_types, self.ecs_temperature)
+            if cell_types is not None
+            else model_out["e_pert_pred"].new_tensor(0.0)
+        )
+
+        total = (
+            self.w_delta    * l_delta
+            + self.w_pert_rec * l_pert_rec
+            + self.w_ecs      * l_ecs
+        )
+
+        return {
+            "loss":       total,
+            "l_delta":    l_delta.detach(),
+            "l_pert_rec": l_pert_rec.detach(),
+            "l_ecs":      l_ecs.detach(),
         }
 
 

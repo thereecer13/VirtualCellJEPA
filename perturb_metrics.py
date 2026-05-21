@@ -200,6 +200,7 @@ def evaluate_perturbation(
     batch_size: int = 64,
     device: Optional[torch.device] = None,
     predict_delta: bool = False,
+    predict_traj: bool = False,
 ) -> dict:
     """
     Evaluate perturbation prediction on a held-out test set.
@@ -268,6 +269,10 @@ def evaluate_perturbation(
             ctrl_proxy = bins_to_expr(values.cpu().numpy(), n_bins)
             delta_hat  = out["delta_hat"].cpu().numpy()
             pred_proxy = ctrl_proxy + delta_hat / n_bins
+        elif predict_traj:
+            out = model.forward_perturb_traj(gene_ids, values, pert_ids, pert_values, is_pad)
+            logits = out["v_hat_pert"].cpu().numpy()
+            pred_proxy = logits_to_expr(logits, n_bins)
         else:
             out = model.forward_perturb(gene_ids, values, pert_ids, pert_values, is_pad)
             logits = out["v_hat_pert"].cpu().numpy()

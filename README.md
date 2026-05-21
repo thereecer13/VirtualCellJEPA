@@ -7,26 +7,79 @@ A PyTorch implementation of **Cell-JEPA**, a joint-embedding predictive architec
 > *Cell-JEPA: Latent Representation Learning for Single-Cell Transcriptomics*
 > ElSheikh et al., arXiv:2602.02093 (2026)
 
-Cell-JEPA augments a masked gene-expression reconstruction objective (following scGPT) with a latent-space JEPA loss: a student encoder processes masked inputs and is trained to predict the cell-level embedding produced by an EMA teacher encoder from unmasked inputs. This encourages the model to learn dropout-robust representations of cellular state rather than memorising measurement noise.
+This repository also includes **CellJEPA_SIGReg**, an EMA-free variant that replaces the student-teacher JEPA objective with SIGReg (Sketched Isotropic Gaussian Regularization, Balestriero & LeCun 2025).
+
+---
+
+## Models
+
+### Cell-JEPA (`cell_jepa.py`)
+
+Student-teacher Transformer for scRNA-seq. The student encoder processes masked gene expression; an EMA teacher encoder processes the unmasked global view. A predictor MLP is trained to predict the teacher's CLS embedding from the student's masked CLS embedding (JEPA cosine loss). An EMA momentum of 0.996 provides stable targets without collapse.
+
+### CellJEPA_SIGReg (`cell_sigreg.py`)
+
+EMA-free variant with a single shared encoder. Processes one global unmasked view and V masked views. Replaces the JEPA objective with:
+- **L_sim**: cosine alignment between global and masked view CLS embeddings
+- **L_SIGReg**: Epps-Pulley-based Gaussian regularization over random projections — prevents dimensional collapse without a teacher network
+
+`encode()` has the same signature as `CellJEPA.encode()` for eval compatibility.
+
+---
+
+## Perturbation Prediction
+
+Both models support three perturbation prediction strategies (activated when `n_perturbations > 0`):
+
+| Mode | Method | Key idea |
+|---|---|---|
+| **Absolute** | `forward_perturb` | Inject perturbation embedding into tokens; predict post-pert expression directly |
+| **Delta** | `forward_perturb_delta` | Same injection; add regression head for Δ = pert − ctrl per gene |
+| **Trajectory** | `forward_perturb_traj` | Encoder sees only control state; decoupled `p_traj` MLP predicts latent shift Δe; reconstruction from `H_ctrl + e_pert_pred` |
+
+The trajectory mode's delta loss `1 − cos_sim(Δe_pred, Δe_target)` supervises the direction of change in embedding space, which empirically improves Top-20 DEG Pearson Δ — the most clinically relevant perturbation metric.
 
 ---
 
 ## Repository Structure
 
+### Core
+
 | File | Description |
 |---|---|
-| `cell_jepa.py` | Core model — student/teacher transformer, EMA update, perturbation heads |
-| `losses.py` | Pre-training, fine-tuning, and perturbation loss functions |
-| `trainer.py` | `Pretrainer`, `Finetuner`, and `PerturbationTrainer` with checkpoint save/resume |
+| `cell_jepa.py` | Cell-JEPA model — student/teacher transformer, EMA update, all perturbation heads |
+| `cell_sigreg.py` | CellJEPA_SIGReg — single encoder, multi-view SIGReg, same perturbation heads |
+| `losses.py` | All loss functions: pre-training, fine-tuning, perturbation (including SIGReg and trajectory variants) |
+| `trainer.py` | Config dataclasses and trainers for all modes (`Pretrainer`, `Finetuner`, `PerturbationTrainer`, SIGReg equivalents) |
 | `preprocessing.py` | Per-cell quantile binning, `SingleCellDataset`, `PerturbationDataset` |
-| `perturb_metrics.py` | Perturbation evaluation: Pearson, PearsonΔ, Top-20 DEG PearsonΔ, MSE |
 | `metrics.py` | Clustering evaluation: NMI, ARI, ASW, AvgBIO |
+| `perturb_metrics.py` | Perturbation evaluation: Pearson, PearsonΔ, Top-20 DEG PearsonΔ, MSE |
+
+### Experiment Scripts
+
+| File | Description |
+|---|---|
 | `pretrain_kidney.py` | Pre-train on ~800k human kidney cells from CELLxGENE Census |
-| `compare_perturbation.py` | 2×2 ablation: absolute vs. delta objective × JEPA on/off (Adamson 2016) |
-| `compare_pbmc3k.py` | Cell-type clustering evaluation on PBMC 3k (NMI, ARI, ASW, AvgBIO) |
-| `example.py` | Minimal end-to-end usage example |
-| `JEPA_Colab.ipynb` | Colab notebook: kidney pre-training + perturbation ablation on A100 |
-| `requirements.txt` | Python dependencies |
+| `pretrain_pbmc68k.py` | Pre-train on PBMC-68K |
+| `pretrain_universal.py` | Pre-train both CellJEPA and SIGReg with a shared universal gene vocabulary |
+| `build_universal_vocab.py` | Merge gene name sets from multiple datasets into one JSON vocab file |
+| `compare_pbmc3k.py` | Cell-type clustering benchmark on PBMC 3k (NMI, ARI, ASW, AvgBIO) |
+| `compare_perturbation.py` | 2×2 ablation: absolute vs. delta × JEPA on/off (Adamson 2016) |
+| `compare_traj_modes.py` | 3-mode comparison: absolute vs. delta vs. trajectory (Adamson 2016) |
+| `run_ablation.py` | CellJEPA vs. SIGReg zero-shot and fine-tuned clustering ablation |
+| `run_transfer_universal.py` | Universal vocab transfer: kidney/PBMC-68K pre-training → PBMC-3K evaluation |
+| `run_transfer.py` / `run_transfer_pbmc68k.py` | Gene-aligned transfer experiments |
+| `example.py` | Minimal end-to-end usage example (no GPU needed) |
+
+### Notebooks (Colab)
+
+| Notebook | Description |
+|---|---|
+| `JEPA_Colab.ipynb` | Kidney pre-training + perturbation ablation on A100 |
+| `SIGReg_Ablation_Colab.ipynb` | CellJEPA vs. SIGReg 2×2 clustering ablation |
+| `UniversalVocab_Colab.ipynb` | Universal vocab pre-training + transfer experiment |
+| `TrajModes_Colab.ipynb` | 3-mode perturbation comparison from pre-trained checkpoint |
+| `DataDiagnostics_Colab.ipynb` | Dataset statistics, HVG overlap heatmaps, UMAP, transfer signal analysis |
 
 ---
 
@@ -38,62 +91,72 @@ Cell-JEPA augments a masked gene-expression reconstruction objective (following 
 pip install -r requirements.txt
 ```
 
-### 1. Kidney pre-training (replicates paper Section 3.1)
+### Sanity check (no GPU)
 
-Downloads ~800k human kidney cells from CELLxGENE Census, trains Cell-JEPA for 4 epochs, and saves per-epoch checkpoints.
+```bash
+python example.py
+```
+
+### Kidney pre-training
 
 ```bash
 python pretrain_kidney.py --device cuda --drive_dir ./checkpoints/
-```
-
-Resume after interruption:
-
-```bash
+# Resume after interruption:
 python pretrain_kidney.py --device cuda --drive_dir ./checkpoints/ --resume ./checkpoints/kidney_pretrain_epoch2.pt
 ```
 
-To align the kidney gene vocabulary with a downstream task's gene set (recommended before perturbation fine-tuning):
+### Universal vocabulary pre-training
+
+Solves the gene-overlap problem for cross-dataset transfer (only ~7% HVG overlap between kidney and PBMC-3K with gene-aligned approach).
 
 ```bash
-python pretrain_kidney.py --device cuda --drive_dir ./checkpoints/ --gene_list adamson_genes.json
+# Build shared vocab once:
+python build_universal_vocab.py --drive_dir ./checkpoints/universal_vocab/
+
+# Pre-train both variants:
+python pretrain_universal.py \
+    --source kidney \
+    --vocab_file ./checkpoints/universal_vocab/universal_gene_names.json \
+    --drive_dir ./checkpoints/ \
+    --device cuda
 ```
 
-### 2. Perturbation ablation (replicates paper Section 3.4)
+### Perturbation mode comparison (Adamson 2016)
 
-Runs a 2×2 ablation on the Adamson 2016 Perturb-seq dataset comparing absolute vs. delta reconstruction objectives with and without the JEPA loss. Downloads the dataset automatically (~470 MB).
+Compares absolute, delta, and trajectory prediction modes from a pre-trained backbone:
 
-Without pre-training:
 ```bash
-python compare_perturbation.py --device cuda
+python compare_traj_modes.py \
+    --pretrain_checkpoint ./checkpoints/jepa_final.pt \
+    --device cuda
+
+# Smoke test (~2 min, CPU):
+python compare_traj_modes.py --smoke_test --device cpu
 ```
 
-With kidney pre-trained backbone:
+### 2×2 perturbation ablation
+
 ```bash
-python compare_perturbation.py --device cuda --pretrain_checkpoint ./checkpoints/kidney_pretrain_final.pt
+python compare_perturbation.py --device cuda --pretrain_checkpoint ./checkpoints/jepa_final.pt
 ```
 
-Smoke test (~1 min, CPU):
-```bash
-python compare_perturbation.py --smoke_test --device cpu
-```
-
-### 3. PBMC clustering (replicates paper Section 3.2–3.3)
-
-Evaluates cell-type clustering on PBMC 3k after fine-tuning from a pre-trained checkpoint.
+### PBMC clustering benchmark
 
 ```bash
 python compare_pbmc3k.py --device cuda
 ```
 
-### 4. Colab notebook
+### CellJEPA vs. SIGReg ablation
 
-`JEPA_Colab.ipynb` provides a self-contained 7-cell workflow for running kidney pre-training and the perturbation ablation end-to-end on a Colab A100, with automatic Drive checkpointing and resume.
+```bash
+python run_ablation.py --variant all --device cuda
+```
 
 ---
 
 ## Pre-training Configuration
 
-The default hyperparameters match Appendix E.1 of the paper:
+Default hyperparameters match Appendix E.1 of the paper:
 
 | Hyperparameter | Value |
 |---|---|
@@ -103,8 +166,11 @@ The default hyperparameters match Appendix E.1 of the paper:
 | Epochs | 4 |
 | Mask ratio | 0.15 |
 | L_max | 600 genes per cell |
+| EMA momentum | 0.996 |
 | JEPA loss weight | 1000 |
 | Reconstruction loss weight | 1 |
+
+SIGReg uses linear warmup (1000 steps default) + exponential decay. If `l_sim` is erratic in early training, increase `warmup_steps` to 5000.
 
 ---
 
