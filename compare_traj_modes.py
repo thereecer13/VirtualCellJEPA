@@ -389,7 +389,8 @@ def main():
     print(f"Using device: {device}")
 
     if args.smoke_test:
-        print("\n[SMOKE TEST: 3 perturbations, 1 epoch, 500 cells]\n")
+        args.l_max = 100  # keep CPU smoke test fast; coverage doesn't matter here
+        print("\n[SMOKE TEST: 3 perturbations, 1 epoch, 500 cells, L_max=100]\n")
 
     ctrl_matrix, pert_matrix, pert_ids_cell, conditions, pert_vocab, gene_names, ctrl_label = \
         load_adamson(n_hvg=args.n_hvg, smoke_test=args.smoke_test)
