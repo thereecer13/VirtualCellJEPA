@@ -57,6 +57,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to pre-trained CellJEPA checkpoint (.pt). "
              "Backbone weights are loaded; perturbation-specific heads are left at random init.",
     )
+    p.add_argument(
+        "--vocab_file", default=None,
+        help="Path to universal_gene_names.json. When provided alongside "
+             "--pretrain_checkpoint, Adamson gene names are mapped to their "
+             "universal vocab token IDs so the pre-trained gene embeddings "
+             "are correctly aligned.",
+    )
     return p.parse_args()
 
 
@@ -328,6 +335,51 @@ def print_and_save(all_results: dict, results_file: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Universal vocab alignment
+# ---------------------------------------------------------------------------
+
+def align_to_universal_vocab(ctrl_matrix, pert_matrix, gene_names, vocab_file):
+    """
+    Project Adamson expression matrices into universal vocab space so that
+    gene name → token ID is consistent with a universally pre-trained checkpoint.
+
+    Token ID for universal gene at position i is i+2 (0=<cls>, 1=<pad>),
+    matching the convention in pretrain_universal.py.
+
+    Returns:
+        ctrl_uni   : (N, n_universal) projected control matrix
+        pert_uni   : (N, n_universal) projected pert matrix
+        vocab_size : n_universal + 2
+        gene_vocab : {i: i+2 for i in range(n_universal)}
+    """
+    import json
+    universal_gene_names = json.load(open(vocab_file))
+    n_uni    = len(universal_gene_names)
+    uni_idx  = {g: i for i, g in enumerate(universal_gene_names)}
+
+    N        = ctrl_matrix.shape[0]
+    ctrl_uni = np.zeros((N, n_uni), dtype=np.float32)
+    pert_uni = np.zeros((N, n_uni), dtype=np.float32)
+
+    n_mapped = 0
+    for src_idx, gene in enumerate(gene_names):
+        if gene in uni_idx:
+            k = uni_idx[gene]
+            ctrl_uni[:, k] = ctrl_matrix[:, src_idx]
+            pert_uni[:, k] = pert_matrix[:, src_idx]
+            n_mapped += 1
+
+    pct = n_mapped / len(gene_names) * 100
+    print(f"  Universal vocab alignment: {n_mapped}/{len(gene_names)} Adamson HVGs "
+          f"mapped ({pct:.1f}% coverage)  →  vocab_size={n_uni + 2}")
+    if pct < 30:
+        print(f"  WARNING: low coverage ({pct:.1f}%) — gene name formats may not match "
+              f"(e.g. Ensembl IDs vs. symbols). Check universal_gene_names.json.")
+
+    return ctrl_uni, pert_uni, n_uni + 2, {i: i + 2 for i in range(n_uni)}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -339,13 +391,19 @@ def main():
     if args.smoke_test:
         print("\n[SMOKE TEST: 3 perturbations, 1 epoch, 500 cells]\n")
 
-    ctrl_matrix, pert_matrix, pert_ids_cell, conditions, pert_vocab, _, ctrl_label = \
+    ctrl_matrix, pert_matrix, pert_ids_cell, conditions, pert_vocab, gene_names, ctrl_label = \
         load_adamson(n_hvg=args.n_hvg, smoke_test=args.smoke_test)
 
-    n_genes = ctrl_matrix.shape[1]
     n_perturbations = len(pert_vocab)
-    gene_vocab = {i: i + 2 for i in range(n_genes)}
-    vocab_size = n_genes + 2
+
+    if args.vocab_file:
+        ctrl_matrix, pert_matrix, vocab_size, gene_vocab = align_to_universal_vocab(
+            ctrl_matrix, pert_matrix, gene_names, args.vocab_file
+        )
+    else:
+        n_genes    = ctrl_matrix.shape[1]
+        vocab_size = n_genes + 2
+        gene_vocab = {i: i + 2 for i in range(n_genes)}
 
     unique_perts = [p for p in pert_vocab if p != ctrl_label]
     rng = np.random.default_rng(42)
