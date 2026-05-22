@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cuda / mps / cpu")
     p.add_argument("--n_epochs", type=int, default=15)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--l_max", type=int, default=200,
+    p.add_argument("--l_max", type=int, default=600,
                    help="Max genes per sequence (default 200)")
     p.add_argument("--n_hvg", type=int, default=2000,
                    help="Number of highly variable genes (default 2000)")
