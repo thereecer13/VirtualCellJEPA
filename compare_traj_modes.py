@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cuda / mps / cpu")
     p.add_argument("--n_epochs", type=int, default=15)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--l_max", type=int, default=200)
+    p.add_argument("--l_max", type=int, default=600)
     p.add_argument("--n_hvg", type=int, default=2000)
     p.add_argument("--test_fraction", type=float, default=0.2)
     p.add_argument("--results_file", default="results_traj_modes.txt")
