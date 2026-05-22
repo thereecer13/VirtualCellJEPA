@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
              "Backbone weights are loaded; perturbation-specific heads are left at random init.",
     )
     p.add_argument(
+        "--ctrl_label", default=None,
+        help="Override automatic control label detection (e.g. 'ctrl', 'non-targeting'). "
+             "Run once without this flag to see all condition labels printed, then rerun.",
+    )
+    p.add_argument(
         "--vocab_file", default=None,
         help="Path to universal_gene_names.json. When provided alongside "
              "--pretrain_checkpoint, Adamson gene names are mapped to their "
@@ -118,7 +123,7 @@ def _load_adamson_adata():
     return ad.read_h5ad(local_path)
 
 
-def load_adamson(n_hvg: int = 2000, smoke_test: bool = False):
+def load_adamson(n_hvg: int = 2000, smoke_test: bool = False, ctrl_label_override: str | None = None):
     print("Loading Adamson 2016 Perturb-seq …")
     adata = _load_adamson_adata()
     print(f"  Raw: {adata.n_obs} cells × {adata.n_vars} genes")
@@ -139,19 +144,39 @@ def load_adamson(n_hvg: int = 2000, smoke_test: bool = False):
         conditions_raw = conditions_raw[valid_mask]
 
     unique_vals, val_counts = np.unique(conditions_raw, return_counts=True)
-    ctrl_label = None
-    for candidate in ["ctrl", "control", "Control", "CTRL", "non-targeting", "NT"]:
-        if candidate in conditions_raw:
-            ctrl_label = candidate
-            break
-    if ctrl_label is None:
-        for v in unique_vals:
-            if v.lower() == "ctrl":
-                ctrl_label = v
+
+    # Always print top 20 and all conditions so the user can identify the control
+    top20_idx = np.argsort(val_counts)[::-1][:20]
+    print(f"  Top 20 conditions by cell count:")
+    for i in top20_idx:
+        print(f"    '{unique_vals[i]}': {val_counts[i]} cells")
+    print(f"  All conditions ({len(unique_vals)} total):")
+    for v, c in sorted(zip(unique_vals, val_counts), key=lambda x: x[0]):
+        print(f"    '{v}': {c} cells")
+
+    if ctrl_label_override:
+        if ctrl_label_override not in conditions_raw:
+            raise ValueError(
+                f"--ctrl_label '{ctrl_label_override}' not found in dataset. "
+                f"Check the condition list above."
+            )
+        ctrl_label = ctrl_label_override
+        print(f"  Control label (override): '{ctrl_label}'  ({(conditions_raw == ctrl_label).sum()} cells)")
+    else:
+        ctrl_label = None
+        for candidate in ["ctrl", "control", "Control", "CTRL", "non-targeting", "NT"]:
+            if candidate in conditions_raw:
+                ctrl_label = candidate
                 break
-    if ctrl_label is None:
-        ctrl_label = unique_vals[np.argmax(val_counts)]
-        print(f"  Warning: using most-frequent as ctrl: '{ctrl_label}'")
+        if ctrl_label is None:
+            for v in unique_vals:
+                if v.lower() == "ctrl":
+                    ctrl_label = v
+                    break
+        if ctrl_label is None:
+            ctrl_label = unique_vals[np.argmax(val_counts)]
+            print(f"  Warning: no standard ctrl label found — using most-frequent: '{ctrl_label}'")
+            print(f"  Tip: rerun with --ctrl_label <correct_label> to override.")
 
     print(f"  Control label: '{ctrl_label}'  ({(conditions_raw == ctrl_label).sum()} cells)")
 
@@ -393,7 +418,8 @@ def main():
         print("\n[SMOKE TEST: 3 perturbations, 1 epoch, 500 cells, L_max=100]\n")
 
     ctrl_matrix, pert_matrix, pert_ids_cell, conditions, pert_vocab, gene_names, ctrl_label = \
-        load_adamson(n_hvg=args.n_hvg, smoke_test=args.smoke_test)
+        load_adamson(n_hvg=args.n_hvg, smoke_test=args.smoke_test,
+                     ctrl_label_override=args.ctrl_label)
 
     n_perturbations = len(pert_vocab)
 
