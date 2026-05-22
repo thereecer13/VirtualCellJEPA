@@ -549,7 +549,7 @@ class PerturbationTrainer:
             )
         elif config.predict_delta:
             self.criterion = DeltaPerturbationLoss(
-                w_delta=config.w_pert_rec,
+                w_delta=config.w_delta,
                 w_jepa_pert=config.w_jepa_pert,
                 w_ecs=config.w_ecs,
                 ecs_temperature=config.ecs_temperature,
@@ -760,7 +760,7 @@ class SIGRegPerturbationTrainer:
             )
         elif config.predict_delta:
             self.criterion = SIGRegDeltaPerturbationLoss(
-                w_delta=config.w_pert_rec,
+                w_delta=config.w_delta,
                 w_ecs=config.w_ecs,
                 ecs_temperature=config.ecs_temperature,
             )
